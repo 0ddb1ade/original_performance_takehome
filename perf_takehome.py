@@ -163,8 +163,11 @@ class KernelBuilder:
                 engine, slot
             )
             if barrier:
-                c = place(engine, slot, max_cycle + 1)
-                floor = c + 1
+                # Pauses share a bundle with regular work where possible: the
+                # whole bundle executes, then the core pauses. Subsequent ops
+                # may also share the pause cycle (they run in the same step).
+                c = place(engine, slot, max(max_cycle, 0))
+                floor = c
                 max_cycle = max(max_cycle, c)
                 continue
             earliest = 0
@@ -198,10 +201,11 @@ class KernelBuilder:
 
         return [b for b in bundles if b]
 
-    def vop(self, op, dest, a, b, scalar=False):
+    def vop(self, op, dest, a, b, scalar=lambda: False):
         """An elementwise vector op, either as one valu slot or as VLEN
         scalar alu slots (the alu engine has 12 slots/cycle and is otherwise
         idle, so spilling cheap vector ops there relieves the valu engine).
+        `scalar` is a callable so the spill policy can rotate per op.
         """
         if scalar():
             for i in range(VLEN):
@@ -209,7 +213,7 @@ class KernelBuilder:
         else:
             self.emit("valu", (op, dest, a, b))
 
-    def emit_hash_v(self, val, t1, t2, scalar=False):
+    def emit_hash_v(self, val, t1, t2, scalar=lambda: False):
         """Vectorized myhash on the vector register `val` (in place).
 
         Stages of the form (a + C) + (a << k) collapse to a single
@@ -230,34 +234,40 @@ class KernelBuilder:
         touching memory: select among the 2**d possible nodes.
 
         Bottom-level selects between two known node values are a single
-        multiply_add with precomputed (right-left) broadcast diffs; the
-        merging selects between per-element vectors go to the flow engine
-        (vselect), which is otherwise idle. With bottom_flow the bottom
-        level also goes to the flow engine, trading valu for flow slots.
-        """
+        multiply_add with precomputed broadcast diffs; the merging selects
+        between per-element vectors go to the flow engine (vselect), which
+        is otherwise idle. With bottom_flow the bottom level also goes to
+        the flow engine, trading valu for flow slots.
 
-        def rec(j0, j1, bi):
-            if j1 - j0 == 2:
+        Latency: the tree is keyed so the *newest* path bit (computed last
+        round) decides the root select, while everything below depends only
+        on older bits and can be scheduled ahead of time. The level at
+        recursion depth k keys on bits[d-1-k]; the bottom level pairs nodes
+        differing in the oldest bit (the j-MSB), i.e. p vs p + 2**(d-1).
+        """
+        half = 2 ** (d - 1)
+
+        def rec(p, k):
+            if k == d - 1:
                 t = free.pop()
                 if bottom_flow:
                     self.emit(
                         "flow",
-                        ("vselect", t, bits[d - 1], bcast[d][j0 + 1], bcast[d][j0]),
+                        ("vselect", t, bits[0], bcast[d][p + half], bcast[d][p]),
                     )
                 else:
                     self.emit(
                         "valu",
-                        ("multiply_add", t, bits[d - 1], diff[d][j0 // 2], bcast[d][j0]),
+                        ("multiply_add", t, bits[0], diff[d][p], bcast[d][p]),
                     )
                 return t
-            mid = (j0 + j1) // 2
-            left = rec(j0, mid, bi + 1)
-            right = rec(mid, j1, bi + 1)
-            self.emit("flow", ("vselect", left, bits[bi], right, left))
+            left = rec(p, k + 1)
+            right = rec(p + 2**k, k + 1)
+            self.emit("flow", ("vselect", left, bits[d - 1 - k], right, left))
             free.append(right)
             return left
 
-        return rec(0, 2**d, 0)
+        return rec(0, 0)
 
     def build_kernel(
         self,
@@ -301,7 +311,7 @@ class KernelBuilder:
         # Tuning knobs (env-overridable for experiments; defaults are the
         # measured best).
         # Number of rotating register pools (in-flight vectors).
-        N_POOLS = int(os.environ.get("KB_POOLS", "13"))
+        N_POOLS = int(os.environ.get("KB_POOLS", "14"))
         # Select-tree bottom levels at depths >= this go to the flow engine.
         # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
         # having idle slots overall, because flow executes only 1 slot/cycle
@@ -310,6 +320,11 @@ class KernelBuilder:
         # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
         # slots on the alu engine instead of one valu slot.
         alu_frac = int(os.environ.get("KB_ALU_FRAC", "9"))
+
+        # First pause: matches the first yield of reference_kernel2. Memory
+        # is first modified by the final vstores, so this can sit at cycle 0
+        # and let the setup work overlap the main body.
+        self.emit("flow", ("pause",))
 
         vc_one = self.vconst(1)
         vc_two = self.vconst(2)
@@ -339,46 +354,52 @@ class KernelBuilder:
         self.emit("valu", ("vbroadcast", root_b, nodes_s))
         bcast = {}
         diff = {}
-        # Odd-node broadcasts are only kept when the flow-engine bottom-level
-        # select path needs them; otherwise their slots become the diffs.
-        keep_odd = flow_min_depth <= D
+        # The bottom select level pairs node p with node p + 2^(d-1) (they
+        # differ in the oldest path bit). Upper-half broadcasts are only kept
+        # when the flow-engine bottom-level select path needs them; otherwise
+        # their slots become the diffs.
+        keep_upper = flow_min_depth <= D
         for d in range(1, D + 1):
             lo = 2**d - 1
-            bcast[d] = []
+            half = 2 ** (d - 1)
+            lower = []
+            upper = []
             diff[d] = []
-            for j in range(0, 2**d, 2):
-                a = self.alloc_scratch(f"nb_{d}_{j}", VLEN)
-                self.emit("valu", ("vbroadcast", a, nodes_s + lo + j))
-                odd = self.alloc_scratch(f"nb_{d}_{j + 1}", VLEN)
-                self.emit("valu", ("vbroadcast", odd, nodes_s + lo + j + 1))
-                if keep_odd:
-                    df = self.alloc_scratch(f"nd_{d}_{j // 2}", VLEN)
+            for p in range(half):
+                a = self.alloc_scratch(f"nb_{d}_{p}", VLEN)
+                self.emit("valu", ("vbroadcast", a, nodes_s + lo + p))
+                up = self.alloc_scratch(f"nb_{d}_{p + half}", VLEN)
+                self.emit("valu", ("vbroadcast", up, nodes_s + lo + half + p))
+                if keep_upper:
+                    df = self.alloc_scratch(f"nd_{d}_{p}", VLEN)
                 else:
-                    df = odd  # diff overwrites the odd broadcast
-                self.emit("valu", ("-", df, odd, a))
-                bcast[d].extend((a, odd if keep_odd else None))
+                    df = up  # diff overwrites the upper broadcast
+                self.emit("valu", ("-", df, up, a))
+                lower.append(a)
+                upper.append(up if keep_upper else None)
                 diff[d].append(df)
+            bcast[d] = lower + upper
 
         # Rotating register pools: each in-flight vector owns its values,
         # gather address, path bits and temporaries.
         pools = []
         for p in range(N_POOLS):
+            bits = [self.alloc_scratch(f"b{i}_{p}", VLEN) for i in range(D)]
+            # The gather address can alias bits[0]: addr is written by the
+            # Horner at depth D (whose first op consumes bits[0]) and last
+            # read at the bottom of the descent, before the next descent's
+            # depth-0 round rewrites bits[0].
+            addr = bits[0] if D >= 1 else self.alloc_scratch(f"addr_{p}", VLEN)
             pools.append(
                 {
                     "val": self.alloc_scratch(f"val_{p}", VLEN),
-                    "addr": self.alloc_scratch(f"addr_{p}", VLEN),
-                    "bits": [
-                        self.alloc_scratch(f"b{i}_{p}", VLEN) for i in range(D)
-                    ],
+                    "addr": addr,
+                    "bits": bits,
                     "tmp": [self.alloc_scratch(f"m{i}_{p}", VLEN) for i in range(4)],
                 }
             )
 
         val_addr_c = [self.scratch_const(values_p + v * VLEN) for v in range(n_vec)]
-
-        # First pause: matches the first yield of reference_kernel2 (memory
-        # is still unmodified at this point).
-        self.emit("flow", ("pause",))
 
         for v in range(n_vec):
             P = pools[v % N_POOLS]
@@ -417,22 +438,30 @@ class KernelBuilder:
                 if r + 1 < rounds and d != forest_height:
                     b = bits[d] if d < D else ht[0]
                     self.vop("&", b, val, vc_one, scalar)
+                    # The next gather address is always arranged as
+                    # addr = (precomputable accumulator) + b, so the critical
+                    # path after the new bit is a single op.
                     if d == D:
-                        # Next round gathers: build the address from the path
-                        # bits via Horner.
+                        # Next round gathers: Horner over the old path bits
+                        # lands in addr ahead of time, then addr += b.
                         if D == 0:
                             self.emit("valu", ("+", addr, b, vc_horner))
                         else:
                             src = bits[0]
-                            for x in bits[1:] + [b]:
+                            for x in bits[1:]:
                                 self.emit(
-                                    "valu", ("multiply_add", ht[1], src, vc_two, x)
+                                    "valu", ("multiply_add", addr, src, vc_two, x)
                                 )
-                                src = ht[1]
-                            self.emit("valu", ("+", addr, src, vc_horner))
+                                src = addr
+                            self.emit(
+                                "valu", ("multiply_add", addr, src, vc_two, vc_horner)
+                            )
+                            self.vop("+", addr, addr, b, scalar)
                     elif d > D:
-                        self.vop("+", ht[1], b, vc_step, scalar)
-                        self.emit("valu", ("multiply_add", addr, addr, vc_two, ht[1]))
+                        # addr = (2*addr + step) + b; the multiply_add only
+                        # needs last round's addr.
+                        self.emit("valu", ("multiply_add", addr, addr, vc_two, vc_step))
+                        self.vop("+", addr, addr, b, scalar)
             # Write final values back to memory (indices aren't checked).
             self.emit("store", ("vstore", val_addr_c[v], val), mem=("values", v))
 
