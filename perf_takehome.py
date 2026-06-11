@@ -198,21 +198,32 @@ class KernelBuilder:
 
         return [b for b in bundles if b]
 
-    def emit_hash_v(self, val, t1, t2):
+    def vop(self, op, dest, a, b, scalar=False):
+        """An elementwise vector op, either as one valu slot or as VLEN
+        scalar alu slots (the alu engine has 12 slots/cycle and is otherwise
+        idle, so spilling cheap vector ops there relieves the valu engine).
+        """
+        if scalar():
+            for i in range(VLEN):
+                self.emit("alu", (op, dest + i, a + i, b + i))
+        else:
+            self.emit("valu", (op, dest, a, b))
+
+    def emit_hash_v(self, val, t1, t2, scalar=False):
         """Vectorized myhash on the vector register `val` (in place).
 
         Stages of the form (a + C) + (a << k) collapse to a single
         multiply_add: a * (1 + 2**k) + C. The xor-based stages need the full
-        three ops.
+        three ops; those are cheap and may be spilled to the scalar alu.
         """
         for op1, c1, op2, op3, c3 in HASH_STAGES:
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 mult = self.vconst(1 + (1 << c3))
                 self.emit("valu", ("multiply_add", val, val, mult, self.vconst(c1)))
             else:
-                self.emit("valu", (op3, t1, val, self.vconst(c3)))
-                self.emit("valu", (op1, t2, val, self.vconst(c1)))
-                self.emit("valu", (op2, val, t1, t2))
+                self.vop(op3, t1, val, self.vconst(c3), scalar)
+                self.vop(op1, t2, val, self.vconst(c1), scalar)
+                self.vop(op2, val, t1, t2, scalar)
 
     def emit_select_tree(self, d, bits, bcast, diff, free, bottom_flow=False):
         """Compute the node value at depth d from the path bits, without
@@ -287,6 +298,19 @@ class KernelBuilder:
         period = forest_height + 1
         D = min(4, forest_height)  # max depth resolved by select trees
 
+        # Tuning knobs (env-overridable for experiments; defaults are the
+        # measured best).
+        # Number of rotating register pools (in-flight vectors).
+        N_POOLS = int(os.environ.get("KB_POOLS", "13"))
+        # Select-tree bottom levels at depths >= this go to the flow engine.
+        # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
+        # having idle slots overall, because flow executes only 1 slot/cycle
+        # and depth-4 rounds burst 15 vselects per vector. Disabled (5 > D).
+        flow_min_depth = int(os.environ.get("KB_FLOW_MIN_DEPTH", "5"))
+        # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
+        # slots on the alu engine instead of one valu slot.
+        alu_frac = int(os.environ.get("KB_ALU_FRAC", "9"))
+
         vc_one = self.vconst(1)
         vc_two = self.vconst(2)
         for op1, c1, op2, op3, c3 in HASH_STAGES:
@@ -315,22 +339,28 @@ class KernelBuilder:
         self.emit("valu", ("vbroadcast", root_b, nodes_s))
         bcast = {}
         diff = {}
+        # Odd-node broadcasts are only kept when the flow-engine bottom-level
+        # select path needs them; otherwise their slots become the diffs.
+        keep_odd = flow_min_depth <= D
         for d in range(1, D + 1):
             lo = 2**d - 1
             bcast[d] = []
-            for j in range(2**d):
+            diff[d] = []
+            for j in range(0, 2**d, 2):
                 a = self.alloc_scratch(f"nb_{d}_{j}", VLEN)
                 self.emit("valu", ("vbroadcast", a, nodes_s + lo + j))
-                bcast[d].append(a)
-            diff[d] = []
-            for k in range(2 ** (d - 1)):
-                a = self.alloc_scratch(f"nd_{d}_{k}", VLEN)
-                self.emit("valu", ("-", a, bcast[d][2 * k + 1], bcast[d][2 * k]))
-                diff[d].append(a)
+                odd = self.alloc_scratch(f"nb_{d}_{j + 1}", VLEN)
+                self.emit("valu", ("vbroadcast", odd, nodes_s + lo + j + 1))
+                if keep_odd:
+                    df = self.alloc_scratch(f"nd_{d}_{j // 2}", VLEN)
+                else:
+                    df = odd  # diff overwrites the odd broadcast
+                self.emit("valu", ("-", df, odd, a))
+                bcast[d].extend((a, odd if keep_odd else None))
+                diff[d].append(df)
 
         # Rotating register pools: each in-flight vector owns its values,
         # gather address, path bits and temporaries.
-        N_POOLS = int(os.environ.get("KB_POOLS", "10"))
         pools = []
         for p in range(N_POOLS):
             pools.append(
@@ -345,12 +375,6 @@ class KernelBuilder:
             )
 
         val_addr_c = [self.scratch_const(values_p + v * VLEN) for v in range(n_vec)]
-
-        # Select-tree bottom levels at depths >= this go to the flow engine.
-        # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
-        # having idle slots overall, because flow executes only 1 slot/cycle
-        # and depth-4 rounds burst 15 vselects per vector. Disabled (5 > D).
-        flow_min_depth = int(os.environ.get("KB_FLOW_MIN_DEPTH", "5"))
 
         # First pause: matches the first yield of reference_kernel2 (memory
         # is still unmodified at this point).
@@ -374,10 +398,17 @@ class KernelBuilder:
                     nv = free.pop()
                     for k in range(VLEN):
                         self.emit("load", ("load_offset", nv, addr, k), mem="forest")
+                # Spill a deterministic spread of the cheap vector ops to the
+                # scalar alu (fraction alu_frac/32, rotating per op).
+                op_counter = [v * 7 + r * 5]
+
+                def scalar():
+                    op_counter[0] += 11
+                    return op_counter[0] % 32 < alu_frac
                 # val = myhash(val ^ node_val)
-                self.emit("valu", ("^", val, val, nv))
+                self.vop("^", val, val, nv, scalar)
                 ht = [t for t in tmp if t != nv]
-                self.emit_hash_v(val, ht[0], ht[1])
+                self.emit_hash_v(val, ht[0], ht[1], scalar)
                 if debug:
                     keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
                     self.emit("debug", ("vcompare", val, keys))
@@ -385,7 +416,7 @@ class KernelBuilder:
                 # the last round.
                 if r + 1 < rounds and d != forest_height:
                     b = bits[d] if d < D else ht[0]
-                    self.emit("valu", ("&", b, val, vc_one))
+                    self.vop("&", b, val, vc_one, scalar)
                     if d == D:
                         # Next round gathers: build the address from the path
                         # bits via Horner.
@@ -400,7 +431,7 @@ class KernelBuilder:
                                 src = ht[1]
                             self.emit("valu", ("+", addr, src, vc_horner))
                     elif d > D:
-                        self.emit("valu", ("+", ht[1], b, vc_step))
+                        self.vop("+", ht[1], b, vc_step, scalar)
                         self.emit("valu", ("multiply_add", addr, addr, vc_two, ht[1]))
             # Write final values back to memory (indices aren't checked).
             self.emit("store", ("vstore", val_addr_c[v], val), mem=("values", v))
