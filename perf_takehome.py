@@ -80,12 +80,114 @@ class KernelBuilder:
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
-    def lower(self, ops):
-        """Lower (engine, slot) ops to instruction bundles.
+    def slot_accesses(self, engine, slot):
+        """Return (reads, writes, mem_read, mem_write, barrier) for a slot."""
+        vec = range(VLEN)
+        match engine, slot:
+            case "alu", (_, dest, a, b):
+                return [a, b], [dest], False, False, False
+            case "valu", ("vbroadcast", dest, src):
+                return [src], [dest + i for i in vec], False, False, False
+            case "valu", ("multiply_add", dest, a, b, c):
+                reads = [x + i for x in (a, b, c) for i in vec]
+                return reads, [dest + i for i in vec], False, False, False
+            case "valu", (_, dest, a, b):
+                reads = [x + i for x in (a, b) for i in vec]
+                return reads, [dest + i for i in vec], False, False, False
+            case "load", ("const", dest, _):
+                return [], [dest], False, False, False
+            case "load", ("load", dest, addr):
+                return [addr], [dest], True, False, False
+            case "load", ("load_offset", dest, addr, off):
+                return [addr + off], [dest + off], True, False, False
+            case "load", ("vload", dest, addr):
+                return [addr], [dest + i for i in vec], True, False, False
+            case "store", ("store", addr, src):
+                return [addr, src], [], False, True, False
+            case "store", ("vstore", addr, src):
+                return [addr] + [src + i for i in vec], [], False, True, False
+            case "flow", ("select", dest, cond, a, b):
+                return [cond, a, b], [dest], False, False, False
+            case "flow", ("vselect", dest, cond, a, b):
+                reads = [x + i for x in (cond, a, b) for i in vec]
+                return reads, [dest + i for i in vec], False, False, False
+            case "flow", ("add_imm", dest, a, _):
+                return [a], [dest], False, False, False
+            case "flow", ("pause",):
+                return [], [], False, False, True
+            case "debug", ("compare", loc, _):
+                return [loc], [], False, False, False
+            case "debug", ("vcompare", loc, _):
+                return [loc + i for i in vec], [], False, False, False
+            case "debug", _:
+                return [], [], False, False, False
+            case _:
+                raise NotImplementedError(f"Unknown slot {engine} {slot}")
 
-        Trivial version: one slot per instruction bundle.
+    def lower(self, ops):
+        """Greedy list scheduler: place each slot in the earliest cycle that
+        respects dependencies and per-engine slot limits.
+
+        Semantics of the machine: all reads in a cycle see the state from the
+        end of the previous cycle, writes land at the end of the cycle. So a
+        consumer must be placed strictly after its producer (RAW), a write
+        strictly after a previous write (WAW), but a write may share a cycle
+        with earlier program-order reads of the old value (WAR).
         """
-        return [{engine: [slot]} for engine, slot in ops]
+        last_write = {}  # scratch addr -> cycle of last write
+        last_read = {}  # scratch addr -> latest cycle of any read
+        mem_last_load = -1
+        mem_last_store = -1
+        max_cycle = -1
+        floor = 0  # barrier floor
+        bundles = []
+
+        def place(engine, slot, earliest):
+            c = max(earliest, floor)
+            while True:
+                while c >= len(bundles):
+                    bundles.append({})
+                slots = bundles[c].setdefault(engine, [])
+                if len(slots) < SLOT_LIMITS[engine]:
+                    slots.append(slot)
+                    return c
+                c += 1
+
+        for engine, slot in ops:
+            reads, writes, mem_read, mem_write, barrier = self.slot_accesses(
+                engine, slot
+            )
+            if barrier:
+                c = place(engine, slot, max_cycle + 1)
+                floor = c + 1
+                max_cycle = max(max_cycle, c)
+                continue
+            earliest = 0
+            for a in reads:
+                earliest = max(earliest, last_write.get(a, -1) + 1)
+            for a in writes:
+                earliest = max(
+                    earliest, last_write.get(a, -1) + 1, last_read.get(a, -1)
+                )
+            if mem_read:
+                earliest = max(earliest, mem_last_store + 1)
+            if mem_write:
+                # Stores may share a cycle with loads (loads see old memory)
+                # and with other stores (all our stores are to disjoint addrs).
+                earliest = max(earliest, mem_last_load, mem_last_store)
+            c = place(engine, slot, earliest)
+            for a in reads:
+                if last_read.get(a, -1) < c:
+                    last_read[a] = c
+            for a in writes:
+                last_write[a] = c
+            if mem_read:
+                mem_last_load = max(mem_last_load, c)
+            if mem_write:
+                mem_last_store = max(mem_last_store, c)
+            max_cycle = max(max_cycle, c)
+
+        return [b for b in bundles if b]
 
     def emit_hash_v(self, val, t1, t2):
         """Vectorized myhash on the vector register `val` (in place)."""
