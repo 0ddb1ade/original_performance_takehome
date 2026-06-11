@@ -214,23 +214,30 @@ class KernelBuilder:
                 self.emit("valu", (op1, t2, val, self.vconst(c1)))
                 self.emit("valu", (op2, val, t1, t2))
 
-    def emit_select_tree(self, d, bits, bcast, diff, free):
+    def emit_select_tree(self, d, bits, bcast, diff, free, bottom_flow=False):
         """Compute the node value at depth d from the path bits, without
         touching memory: select among the 2**d possible nodes.
 
         Bottom-level selects between two known node values are a single
         multiply_add with precomputed (right-left) broadcast diffs; the
         merging selects between per-element vectors go to the flow engine
-        (vselect), which is otherwise idle.
+        (vselect), which is otherwise idle. With bottom_flow the bottom
+        level also goes to the flow engine, trading valu for flow slots.
         """
 
         def rec(j0, j1, bi):
             if j1 - j0 == 2:
                 t = free.pop()
-                self.emit(
-                    "valu",
-                    ("multiply_add", t, bits[d - 1], diff[d][j0 // 2], bcast[d][j0]),
-                )
+                if bottom_flow:
+                    self.emit(
+                        "flow",
+                        ("vselect", t, bits[d - 1], bcast[d][j0 + 1], bcast[d][j0]),
+                    )
+                else:
+                    self.emit(
+                        "valu",
+                        ("multiply_add", t, bits[d - 1], diff[d][j0 // 2], bcast[d][j0]),
+                    )
                 return t
             mid = (j0 + j1) // 2
             left = rec(j0, mid, bi + 1)
@@ -339,6 +346,12 @@ class KernelBuilder:
 
         val_addr_c = [self.scratch_const(values_p + v * VLEN) for v in range(n_vec)]
 
+        # Select-tree bottom levels at depths >= this go to the flow engine.
+        # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
+        # having idle slots overall, because flow executes only 1 slot/cycle
+        # and depth-4 rounds burst 15 vselects per vector. Disabled (5 > D).
+        flow_min_depth = int(os.environ.get("KB_FLOW_MIN_DEPTH", "5"))
+
         # First pause: matches the first yield of reference_kernel2 (memory
         # is still unmodified at this point).
         self.emit("flow", ("pause",))
@@ -353,7 +366,10 @@ class KernelBuilder:
                 if d == 0:
                     nv = root_b
                 elif d <= D:
-                    nv = self.emit_select_tree(d, bits, bcast, diff, free)
+                    bottom_flow = d >= flow_min_depth
+                    nv = self.emit_select_tree(
+                        d, bits, bcast, diff, free, bottom_flow=bottom_flow
+                    )
                 else:
                     nv = free.pop()
                     for k in range(VLEN):
