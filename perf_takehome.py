@@ -190,11 +190,20 @@ class KernelBuilder:
         return [b for b in bundles if b]
 
     def emit_hash_v(self, val, t1, t2):
-        """Vectorized myhash on the vector register `val` (in place)."""
+        """Vectorized myhash on the vector register `val` (in place).
+
+        Stages of the form (a + C) + (a << k) collapse to a single
+        multiply_add: a * (1 + 2**k) + C. The xor-based stages need the full
+        three ops.
+        """
         for op1, c1, op2, op3, c3 in HASH_STAGES:
-            self.emit("valu", (op1, t1, val, self.vconst(c1)))
-            self.emit("valu", (op3, t2, val, self.vconst(c3)))
-            self.emit("valu", (op2, val, t1, t2))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mult = self.vconst(1 + (1 << c3))
+                self.emit("valu", ("multiply_add", val, val, mult, self.vconst(c1)))
+            else:
+                self.emit("valu", (op3, t1, val, self.vconst(c3)))
+                self.emit("valu", (op1, t2, val, self.vconst(c1)))
+                self.emit("valu", (op2, val, t1, t2))
 
     def build_kernel(
         self,
@@ -273,15 +282,13 @@ class KernelBuilder:
                 if debug:
                     keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
                     self.emit("debug", ("vcompare", val[v], keys))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.emit("valu", ("%", t1, val[v], vc_two))
-                self.emit("valu", ("==", t1, t1, vc_zero))
-                self.emit("flow", ("vselect", b, t1, vc_one, vc_two))
-                self.emit("valu", ("*", idx[v], idx[v], vc_two))
-                self.emit("valu", ("+", idx[v], idx[v], b))
+                # idx = 2*idx + 1 + (val & 1)
+                self.emit("valu", ("&", b, val[v], vc_one))
+                self.emit("valu", ("+", b, b, vc_one))
+                self.emit("valu", ("multiply_add", idx[v], idx[v], vc_two, b))
                 # idx = 0 if idx >= n_nodes else idx
                 self.emit("valu", ("<", lt, idx[v], vc_n_nodes))
-                self.emit("flow", ("vselect", idx[v], lt, idx[v], vc_zero))
+                self.emit("valu", ("*", idx[v], idx[v], lt))
                 if debug:
                     keys = tuple((r, v * VLEN + k, "wrapped_idx") for k in range(VLEN))
                     self.emit("debug", ("vcompare", idx[v], keys))
