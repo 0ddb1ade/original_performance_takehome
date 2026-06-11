@@ -76,12 +76,19 @@ class KernelBuilder:
         return self.const_map[val]
 
     def vconst(self, val, name=None):
-        """A vector of VLEN copies of a constant."""
+        """A vector of VLEN copies of a constant. When a staging slot is
+        set, the scalar constant is bounced through it instead of keeping a
+        dedicated scalar slot per value (saves scratch; the scheduler
+        serializes the staging writes)."""
         val = val % (2**32)
         if val not in self.vconst_map:
-            src = self.scratch_const(val)
             addr = self.alloc_scratch(name or f"vc_{val}", VLEN)
-            self.emit("valu", ("vbroadcast", addr, src))
+            staging = getattr(self, "vconst_staging", None)
+            if staging is not None:
+                self.emit("load", ("const", staging, val))
+                self.emit("valu", ("vbroadcast", addr, staging))
+            else:
+                self.emit("valu", ("vbroadcast", addr, self.scratch_const(val)))
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
@@ -311,7 +318,7 @@ class KernelBuilder:
         # Tuning knobs (env-overridable for experiments; defaults are the
         # measured best).
         # Number of rotating register pools (in-flight vectors).
-        N_POOLS = int(os.environ.get("KB_POOLS", "14"))
+        N_POOLS = int(os.environ.get("KB_POOLS", "15"))
         # Select-tree bottom levels at depths >= this go to the flow engine.
         # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
         # having idle slots overall, because flow executes only 1 slot/cycle
@@ -325,6 +332,37 @@ class KernelBuilder:
         # is first modified by the final vstores, so this can sit at cycle 0
         # and let the setup work overlap the main body.
         self.emit("flow", ("pause",))
+
+        # Rotating register pools: each in-flight vector owns its values,
+        # gather address, path bits and temporaries.
+        pools = []
+        for p in range(N_POOLS):
+            bits = [self.alloc_scratch(f"b{i}_{p}", VLEN) for i in range(D)]
+            # The gather address can alias bits[0]: addr is written by the
+            # Horner at depth D (whose first op consumes bits[0]) and last
+            # read at the bottom of the descent, before the next descent's
+            # depth-0 round rewrites bits[0].
+            addr = bits[0] if D >= 1 else self.alloc_scratch(f"addr_{p}", VLEN)
+            pools.append(
+                {
+                    "val": self.alloc_scratch(f"val_{p}", VLEN),
+                    "addr": addr,
+                    "bits": bits,
+                    "tmp": [self.alloc_scratch(f"m{i}_{p}", VLEN) for i in range(4)],
+                }
+            )
+
+        # Load the top D+1 levels of the tree and broadcast each node value.
+        # The staging buffer aliases pool 0's temps (the broadcasts all read
+        # it before vector 0's first rounds write those temps).
+        n_top = 2 ** (D + 1) - 1
+        n_top_pad = (n_top + VLEN - 1) // VLEN * VLEN
+        assert n_top_pad <= 4 * VLEN
+        nodes_s = pools[0]["tmp"][0]
+        # The last staging lane is unused by node values; scalar constants
+        # for vector broadcasts bounce through it.
+        if n_top < n_top_pad:
+            self.vconst_staging = nodes_s + n_top_pad - 1
 
         vc_one = self.vconst(1)
         vc_two = self.vconst(2)
@@ -340,10 +378,6 @@ class KernelBuilder:
         # addr at depth D+1 = horner(path bits) + 2^(D+1) - 1 + forest_p
         vc_horner = self.vconst(2 ** (D + 1) - 1 + forest_p)
 
-        # Load the top D+1 levels of the tree and broadcast each node value.
-        n_top = 2 ** (D + 1) - 1
-        n_top_pad = (n_top + VLEN - 1) // VLEN * VLEN
-        nodes_s = self.alloc_scratch("top_nodes", n_top_pad)
         for k in range(0, n_top_pad, VLEN):
             self.emit(
                 "load",
@@ -380,90 +414,91 @@ class KernelBuilder:
                 diff[d].append(df)
             bcast[d] = lower + upper
 
-        # Rotating register pools: each in-flight vector owns its values,
-        # gather address, path bits and temporaries.
-        pools = []
-        for p in range(N_POOLS):
-            bits = [self.alloc_scratch(f"b{i}_{p}", VLEN) for i in range(D)]
-            # The gather address can alias bits[0]: addr is written by the
-            # Horner at depth D (whose first op consumes bits[0]) and last
-            # read at the bottom of the descent, before the next descent's
-            # depth-0 round rewrites bits[0].
-            addr = bits[0] if D >= 1 else self.alloc_scratch(f"addr_{p}", VLEN)
-            pools.append(
-                {
-                    "val": self.alloc_scratch(f"val_{p}", VLEN),
-                    "addr": addr,
-                    "bits": bits,
-                    "tmp": [self.alloc_scratch(f"m{i}_{p}", VLEN) for i in range(4)],
-                }
-            )
+        # Per-vector value addresses are formed on the flow engine from one
+        # base constant (add_imm into a temp lane), instead of 32 constants.
+        values_base_c = self.scratch_const(values_p)
 
-        val_addr_c = [self.scratch_const(values_p + v * VLEN) for v in range(n_vec)]
-
-        for v in range(n_vec):
+        def emit_vector_round(v, r):
             P = pools[v % N_POOLS]
             val, addr, bits, tmp = P["val"], P["addr"], P["bits"], P["tmp"]
-            self.emit("load", ("vload", val, val_addr_c[v]), mem=("values", v))
-            for r in range(rounds):
-                d = r % period
-                free = list(tmp)
-                if d == 0:
-                    nv = root_b
-                elif d <= D:
-                    bottom_flow = d >= flow_min_depth
-                    nv = self.emit_select_tree(
-                        d, bits, bcast, diff, free, bottom_flow=bottom_flow
-                    )
-                else:
-                    nv = free.pop()
-                    for k in range(VLEN):
-                        self.emit("load", ("load_offset", nv, addr, k), mem="forest")
-                # Spill a deterministic spread of the cheap vector ops to the
-                # scalar alu (fraction alu_frac/32, rotating per op).
-                op_counter = [v * 7 + r * 5]
+            if r == 0:
+                ad = tmp[3]  # lane 0, free until this round's temps are used
+                self.emit("flow", ("add_imm", ad, values_base_c, v * VLEN))
+                self.emit("load", ("vload", val, ad), mem=("values", v))
+            d = r % period
+            free = list(tmp)
+            if d == 0:
+                nv = root_b
+            elif d <= D:
+                bottom_flow = d >= flow_min_depth
+                nv = self.emit_select_tree(
+                    d, bits, bcast, diff, free, bottom_flow=bottom_flow
+                )
+            else:
+                nv = free.pop()
+                for k in range(VLEN):
+                    self.emit("load", ("load_offset", nv, addr, k), mem="forest")
+            # Spill a deterministic spread of the cheap vector ops to the
+            # scalar alu (fraction alu_frac/32, rotating per op).
+            op_counter = [v * 7 + r * 5]
 
-                def scalar():
-                    op_counter[0] += 11
-                    return op_counter[0] % 32 < alu_frac
-                # val = myhash(val ^ node_val)
-                self.vop("^", val, val, nv, scalar)
-                ht = [t for t in tmp if t != nv]
-                self.emit_hash_v(val, ht[0], ht[1], scalar)
-                if debug:
-                    keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
-                    self.emit("debug", ("vcompare", val, keys))
-                # Branch bit; not needed at the leaves (wrap to root) or on
-                # the last round.
-                if r + 1 < rounds and d != forest_height:
-                    b = bits[d] if d < D else ht[0]
-                    self.vop("&", b, val, vc_one, scalar)
-                    # The next gather address is always arranged as
-                    # addr = (precomputable accumulator) + b, so the critical
-                    # path after the new bit is a single op.
-                    if d == D:
-                        # Next round gathers: Horner over the old path bits
-                        # lands in addr ahead of time, then addr += b.
-                        if D == 0:
-                            self.emit("valu", ("+", addr, b, vc_horner))
-                        else:
-                            src = bits[0]
-                            for x in bits[1:]:
-                                self.emit(
-                                    "valu", ("multiply_add", addr, src, vc_two, x)
-                                )
-                                src = addr
+            def scalar():
+                op_counter[0] += 11
+                return op_counter[0] % 32 < alu_frac
+
+            # val = myhash(val ^ node_val)
+            self.vop("^", val, val, nv, scalar)
+            ht = [t for t in tmp if t != nv]
+            self.emit_hash_v(val, ht[0], ht[1], scalar)
+            if debug:
+                keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
+                self.emit("debug", ("vcompare", val, keys))
+            # Branch bit; not needed at the leaves (wrap to root) or on
+            # the last round.
+            if r + 1 < rounds and d != forest_height:
+                b = bits[d] if d < D else ht[0]
+                self.vop("&", b, val, vc_one, scalar)
+                # The next gather address is always arranged as
+                # addr = (precomputable accumulator) + b, so the critical
+                # path after the new bit is a single op.
+                if d == D:
+                    # Next round gathers: Horner over the old path bits
+                    # lands in addr ahead of time, then addr += b.
+                    if D == 0:
+                        self.emit("valu", ("+", addr, b, vc_horner))
+                    else:
+                        src = bits[0]
+                        for x in bits[1:]:
                             self.emit(
-                                "valu", ("multiply_add", addr, src, vc_two, vc_horner)
+                                "valu", ("multiply_add", addr, src, vc_two, x)
                             )
-                            self.vop("+", addr, addr, b, scalar)
-                    elif d > D:
-                        # addr = (2*addr + step) + b; the multiply_add only
-                        # needs last round's addr.
-                        self.emit("valu", ("multiply_add", addr, addr, vc_two, vc_step))
+                            src = addr
+                        self.emit(
+                            "valu", ("multiply_add", addr, src, vc_two, vc_horner)
+                        )
                         self.vop("+", addr, addr, b, scalar)
-            # Write final values back to memory (indices aren't checked).
-            self.emit("store", ("vstore", val_addr_c[v], val), mem=("values", v))
+                elif d > D:
+                    # addr = (2*addr + step) + b; the multiply_add only
+                    # needs last round's addr.
+                    self.emit("valu", ("multiply_add", addr, addr, vc_two, vc_step))
+                    self.vop("+", addr, addr, b, scalar)
+            if r + 1 == rounds:
+                # Write final values back to memory (indices aren't checked).
+                ad = tmp[3] if tmp[3] != nv else tmp[2]
+                self.emit("flow", ("add_imm", ad, values_base_c, v * VLEN))
+                self.emit("store", ("vstore", ad, val), mem=("values", v))
+
+        if os.environ.get("KB_ORDER", "vec") == "rr":
+            # Round-robin emission within each wave of in-flight vectors.
+            for w0 in range(0, n_vec, N_POOLS):
+                wave = range(w0, min(w0 + N_POOLS, n_vec))
+                for r in range(rounds):
+                    for v in wave:
+                        emit_vector_round(v, r)
+        else:
+            for v in range(n_vec):
+                for r in range(rounds):
+                    emit_vector_round(v, r)
 
         # Final pause: matches the last yield of reference_kernel2.
         self.emit("flow", ("pause",))
