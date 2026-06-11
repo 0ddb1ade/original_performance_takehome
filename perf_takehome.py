@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+import os
 import random
 import unittest
 
@@ -50,8 +51,12 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def emit(self, engine, slot):
-        self.ops.append((engine, slot))
+    def emit(self, engine, slot, mem=None):
+        """Queue a slot. `mem` is an optional region tag for memory ops;
+        ops with different tags are assumed not to alias (regions here are
+        the read-only forest and the per-vector value slices, which are all
+        disjoint)."""
+        self.ops.append((engine, slot, mem))
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -136,8 +141,8 @@ class KernelBuilder:
         """
         last_write = {}  # scratch addr -> cycle of last write
         last_read = {}  # scratch addr -> latest cycle of any read
-        mem_last_load = -1
-        mem_last_store = -1
+        mem_last_load = {}  # region tag -> latest load cycle
+        mem_last_store = {}  # region tag -> latest store cycle
         max_cycle = -1
         floor = 0  # barrier floor
         bundles = []
@@ -153,7 +158,7 @@ class KernelBuilder:
                     return c
                 c += 1
 
-        for engine, slot in ops:
+        for engine, slot, mem in ops:
             reads, writes, mem_read, mem_write, barrier = self.slot_accesses(
                 engine, slot
             )
@@ -170,11 +175,15 @@ class KernelBuilder:
                     earliest, last_write.get(a, -1) + 1, last_read.get(a, -1)
                 )
             if mem_read:
-                earliest = max(earliest, mem_last_store + 1)
+                earliest = max(earliest, mem_last_store.get(mem, -1) + 1)
             if mem_write:
                 # Stores may share a cycle with loads (loads see old memory)
                 # and with other stores (all our stores are to disjoint addrs).
-                earliest = max(earliest, mem_last_load, mem_last_store)
+                earliest = max(
+                    earliest,
+                    mem_last_load.get(mem, -1),
+                    mem_last_store.get(mem, -1),
+                )
             c = place(engine, slot, earliest)
             for a in reads:
                 if last_read.get(a, -1) < c:
@@ -182,9 +191,9 @@ class KernelBuilder:
             for a in writes:
                 last_write[a] = c
             if mem_read:
-                mem_last_load = max(mem_last_load, c)
+                mem_last_load[mem] = max(mem_last_load.get(mem, -1), c)
             if mem_write:
-                mem_last_store = max(mem_last_store, c)
+                mem_last_store[mem] = max(mem_last_store.get(mem, -1), c)
             max_cycle = max(max_cycle, c)
 
         return [b for b in bundles if b]
@@ -205,6 +214,33 @@ class KernelBuilder:
                 self.emit("valu", (op1, t2, val, self.vconst(c1)))
                 self.emit("valu", (op2, val, t1, t2))
 
+    def emit_select_tree(self, d, bits, bcast, diff, free):
+        """Compute the node value at depth d from the path bits, without
+        touching memory: select among the 2**d possible nodes.
+
+        Bottom-level selects between two known node values are a single
+        multiply_add with precomputed (right-left) broadcast diffs; the
+        merging selects between per-element vectors go to the flow engine
+        (vselect), which is otherwise idle.
+        """
+
+        def rec(j0, j1, bi):
+            if j1 - j0 == 2:
+                t = free.pop()
+                self.emit(
+                    "valu",
+                    ("multiply_add", t, bits[d - 1], diff[d][j0 // 2], bcast[d][j0]),
+                )
+                return t
+            mid = (j0 + j1) // 2
+            left = rec(j0, mid, bi + 1)
+            right = rec(mid, j1, bi + 1)
+            self.emit("flow", ("vselect", left, bits[bi], right, left))
+            free.append(right)
+            return left
+
+        return rec(0, 2**d, 0)
+
     def build_kernel(
         self,
         forest_height: int,
@@ -214,88 +250,144 @@ class KernelBuilder:
         debug: bool = False,
     ):
         """
-        Vectorized implementation: the whole batch lives in scratch as
-        batch_size//VLEN vector registers for values and indices; memory is
-        only touched for the initial value load, the per-round node-value
-        gathers, and the final value store.
+        Vectorized implementation exploiting the static traversal structure.
 
-        Memory layout (from build_mem_image) is statically known given the
-        problem sizes, so header loads are unnecessary.
+        All indices start at 0 and the traversal descends one level per
+        round; reaching the leaves the next index always wraps to the root
+        (2*idx+1 >= n_nodes for every leaf). So the tree depth of every
+        element is known statically per round:
+
+            depth(r) = r % (forest_height + 1)
+
+        Consequences: no index state, no wrap compare. For rounds at depth
+        d <= SELECT_DEPTH the node value is computed from the path bits by
+        a select tree over preloaded broadcast node values (no memory
+        traffic); only deeper rounds gather node values with scalar loads.
+        The gather address is reconstructed from the path bits once per
+        descent and then updated incrementally.
+
+        Values live in rotating per-vector register pools; memory is only
+        touched for the initial vload, deep-round gathers and the final
+        vstore. The memory layout from build_mem_image is statically known
+        given the problem sizes, so there are no header loads.
         """
         assert batch_size % VLEN == 0
+        assert n_nodes == 2 ** (forest_height + 1) - 1
         n_vec = batch_size // VLEN
         forest_p = 7
         indices_p = forest_p + n_nodes
         values_p = indices_p + batch_size
+        period = forest_height + 1
+        D = min(4, forest_height)  # max depth resolved by select trees
 
-        vc_zero = self.vconst(0)
         vc_one = self.vconst(1)
         vc_two = self.vconst(2)
-        vc_forest_p = self.vconst(forest_p)
-        vc_n_nodes = self.vconst(n_nodes)
-        # Materialize hash constants up front
-        for _, c1, _, _, c3 in HASH_STAGES:
-            self.vconst(c1)
-            self.vconst(c3)
+        for op1, c1, op2, op3, c3 in HASH_STAGES:
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                self.vconst(1 + (1 << c3))
+                self.vconst(c1)
+            else:
+                self.vconst(c1)
+                self.vconst(c3)
+        # addr_next = 2*addr + bit + (1 - forest_p)
+        vc_step = self.vconst(1 - forest_p)
+        # addr at depth D+1 = horner(path bits) + 2^(D+1) - 1 + forest_p
+        vc_horner = self.vconst(2 ** (D + 1) - 1 + forest_p)
 
-        zero_const = self.scratch_const(0)
+        # Load the top D+1 levels of the tree and broadcast each node value.
+        n_top = 2 ** (D + 1) - 1
+        n_top_pad = (n_top + VLEN - 1) // VLEN * VLEN
+        nodes_s = self.alloc_scratch("top_nodes", n_top_pad)
+        for k in range(0, n_top_pad, VLEN):
+            self.emit(
+                "load",
+                ("vload", nodes_s + k, self.scratch_const(forest_p + k)),
+                mem="forest",
+            )
+        root_b = self.alloc_scratch("root_b", VLEN)
+        self.emit("valu", ("vbroadcast", root_b, nodes_s))
+        bcast = {}
+        diff = {}
+        for d in range(1, D + 1):
+            lo = 2**d - 1
+            bcast[d] = []
+            for j in range(2**d):
+                a = self.alloc_scratch(f"nb_{d}_{j}", VLEN)
+                self.emit("valu", ("vbroadcast", a, nodes_s + lo + j))
+                bcast[d].append(a)
+            diff[d] = []
+            for k in range(2 ** (d - 1)):
+                a = self.alloc_scratch(f"nd_{d}_{k}", VLEN)
+                self.emit("valu", ("-", a, bcast[d][2 * k + 1], bcast[d][2 * k]))
+                diff[d].append(a)
 
-        # Per-vector persistent state
-        val = [self.alloc_scratch(f"val{v}", VLEN) for v in range(n_vec)]
-        idx = [self.alloc_scratch(f"idx{v}", VLEN) for v in range(n_vec)]
-
-        # Rotating temp pools so independent vectors don't share temps
-        N_POOLS = 16
+        # Rotating register pools: each in-flight vector owns its values,
+        # gather address, path bits and temporaries.
+        N_POOLS = int(os.environ.get("KB_POOLS", "10"))
         pools = []
         for p in range(N_POOLS):
             pools.append(
                 {
-                    name: self.alloc_scratch(f"{name}_{p}", VLEN)
-                    for name in ("vaddr", "nv", "t1", "t2", "b", "lt")
+                    "val": self.alloc_scratch(f"val_{p}", VLEN),
+                    "addr": self.alloc_scratch(f"addr_{p}", VLEN),
+                    "bits": [
+                        self.alloc_scratch(f"b{i}_{p}", VLEN) for i in range(D)
+                    ],
+                    "tmp": [self.alloc_scratch(f"m{i}_{p}", VLEN) for i in range(4)],
                 }
             )
 
-        # Initial state: values come from memory, indices are all zero
-        val_addr_const = []
-        for v in range(n_vec):
-            val_addr_const.append(self.scratch_const(values_p + v * VLEN))
-            self.emit("load", ("vload", val[v], val_addr_const[v]))
-            self.emit("valu", ("vbroadcast", idx[v], zero_const))
+        val_addr_c = [self.scratch_const(values_p + v * VLEN) for v in range(n_vec)]
 
         # First pause: matches the first yield of reference_kernel2 (memory
         # is still unmodified at this point).
         self.emit("flow", ("pause",))
 
-        for r in range(rounds):
-            for v in range(n_vec):
-                P = pools[v % N_POOLS]
-                vaddr, nv, t1, t2, b, lt = (
-                    P["vaddr"], P["nv"], P["t1"], P["t2"], P["b"], P["lt"],
-                )
-                # node_val = mem[forest_values_p + idx]  (gather)
-                self.emit("valu", ("+", vaddr, idx[v], vc_forest_p))
-                for k in range(VLEN):
-                    self.emit("load", ("load_offset", nv, vaddr, k))
+        for v in range(n_vec):
+            P = pools[v % N_POOLS]
+            val, addr, bits, tmp = P["val"], P["addr"], P["bits"], P["tmp"]
+            self.emit("load", ("vload", val, val_addr_c[v]), mem=("values", v))
+            for r in range(rounds):
+                d = r % period
+                free = list(tmp)
+                if d == 0:
+                    nv = root_b
+                elif d <= D:
+                    nv = self.emit_select_tree(d, bits, bcast, diff, free)
+                else:
+                    nv = free.pop()
+                    for k in range(VLEN):
+                        self.emit("load", ("load_offset", nv, addr, k), mem="forest")
                 # val = myhash(val ^ node_val)
-                self.emit("valu", ("^", val[v], val[v], nv))
-                self.emit_hash_v(val[v], t1, t2)
+                self.emit("valu", ("^", val, val, nv))
+                ht = [t for t in tmp if t != nv]
+                self.emit_hash_v(val, ht[0], ht[1])
                 if debug:
                     keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
-                    self.emit("debug", ("vcompare", val[v], keys))
-                # idx = 2*idx + 1 + (val & 1)
-                self.emit("valu", ("&", b, val[v], vc_one))
-                self.emit("valu", ("+", b, b, vc_one))
-                self.emit("valu", ("multiply_add", idx[v], idx[v], vc_two, b))
-                # idx = 0 if idx >= n_nodes else idx
-                self.emit("valu", ("<", lt, idx[v], vc_n_nodes))
-                self.emit("valu", ("*", idx[v], idx[v], lt))
-                if debug:
-                    keys = tuple((r, v * VLEN + k, "wrapped_idx") for k in range(VLEN))
-                    self.emit("debug", ("vcompare", idx[v], keys))
-
-        # Write final values back to memory (indices aren't checked).
-        for v in range(n_vec):
-            self.emit("store", ("vstore", val_addr_const[v], val[v]))
+                    self.emit("debug", ("vcompare", val, keys))
+                # Branch bit; not needed at the leaves (wrap to root) or on
+                # the last round.
+                if r + 1 < rounds and d != forest_height:
+                    b = bits[d] if d < D else ht[0]
+                    self.emit("valu", ("&", b, val, vc_one))
+                    if d == D:
+                        # Next round gathers: build the address from the path
+                        # bits via Horner.
+                        if D == 0:
+                            self.emit("valu", ("+", addr, b, vc_horner))
+                        else:
+                            src = bits[0]
+                            for x in bits[1:] + [b]:
+                                self.emit(
+                                    "valu", ("multiply_add", ht[1], src, vc_two, x)
+                                )
+                                src = ht[1]
+                            self.emit("valu", ("+", addr, src, vc_horner))
+                    elif d > D:
+                        self.emit("valu", ("+", ht[1], b, vc_step))
+                        self.emit("valu", ("multiply_add", addr, addr, vc_two, ht[1]))
+            # Write final values back to memory (indices aren't checked).
+            self.emit("store", ("vstore", val_addr_c[v], val), mem=("values", v))
 
         # Final pause: matches the last yield of reference_kernel2.
         self.emit("flow", ("pause",))
