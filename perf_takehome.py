@@ -433,7 +433,9 @@ class KernelBuilder:
         else:
             self.emit("valu", (op, dest, a, b))
 
-    def emit_hash_v(self, val, t1, t2, scalar=lambda: False, final_c1=None):
+    def emit_hash_v(
+        self, val, t1, t2, scalar=lambda: False, final_c1=None, raw=False
+    ):
         """Vectorized myhash on the vector register `val` (in place).
 
         Stages of the form (a + C) + (a << k) collapse to a single
@@ -448,7 +450,9 @@ class KernelBuilder:
 
         final_c1 substitutes the last stage's xor constant; passing
         C_last ^ x fuses an extra `^ x` into the hash for free (the last
-        stage is (a ^ C) ^ (a >> k)).
+        stage is (a ^ C) ^ (a >> k)). With raw=True the last stage's
+        constant xor is omitted entirely (deferred to the next round),
+        emitting val_raw = a ^ (a >> k).
         """
         si = 0
         while si < len(HASH_STAGES):
@@ -477,16 +481,22 @@ class KernelBuilder:
                     ("multiply_add", val, val, self.vconst(m), self.vconst(c1)),
                 )
             else:
-                c1v = self.vconst(c1)
-                if final_c1 is not None and si == len(HASH_STAGES) - 1:
-                    c1v = final_c1
-                self.vop(op3, t1, val, self.vconst(c3), scalar)
-                self.vop(op1, t2, val, c1v, scalar)
-                self.vop(op2, val, t1, t2, scalar)
+                last = si == len(HASH_STAGES) - 1
+                if raw and last:
+                    self.vop(op3, t1, val, self.vconst(c3), scalar)
+                    self.vop(op2, val, val, t1, scalar)
+                else:
+                    c1v = self.vconst(c1)
+                    if final_c1 is not None and last:
+                        c1v = final_c1
+                    self.vop(op3, t1, val, self.vconst(c3), scalar)
+                    self.vop(op1, t2, val, c1v, scalar)
+                    self.vop(op2, val, t1, t2, scalar)
             si += 1
 
     def emit_select_tree(
-        self, d, bits, bcast, diff, free, bottom_flow=False, split=False
+        self, d, bits, bcast, diff, free, bottom_flow=False, split=False,
+        swap=False,
     ):
         """Compute the node value at depth d from the path bits, without
         touching memory: select among the 2**d possible nodes.
@@ -505,26 +515,32 @@ class KernelBuilder:
 
         With split=True the root select is left to the caller: returns the
         (left, right) candidate registers instead (broadcasts for d == 1).
+
+        With swap=True the stored bits are inverted (deferred-xor mode): a
+        set bit selects the lower node / left subtree, and the ma base is
+        the upper node (diffs are built to match).
         """
         half = 2 ** (d - 1)
 
         def rec(p, k):
             if k == d - 1:
                 t = free.pop()
+                hi, lo = bcast[d][p + half], bcast[d][p]
+                if swap:
+                    hi, lo = lo, hi
                 if bottom_flow:
-                    self.emit(
-                        "flow",
-                        ("vselect", t, bits[0], bcast[d][p + half], bcast[d][p]),
-                    )
+                    self.emit("flow", ("vselect", t, bits[0], hi, lo))
                 else:
                     self.emit(
-                        "valu",
-                        ("multiply_add", t, bits[0], diff[d][p], bcast[d][p]),
+                        "valu", ("multiply_add", t, bits[0], diff[d][p], lo)
                     )
                 return t
             left = rec(p, k + 1)
             right = rec(p + 2**k, k + 1)
-            self.emit("flow", ("vselect", left, bits[d - 1 - k], right, left))
+            hi, lo = right, left
+            if swap:
+                hi, lo = lo, hi
+            self.emit("flow", ("vselect", left, bits[d - 1 - k], hi, lo))
             free.append(right)
             return left
 
@@ -592,10 +608,11 @@ class KernelBuilder:
         boost = int(os.environ.get("KB_BOOST", "0"))
         # Every g4_mod-th vector gathers at depth D instead of using the
         # deepest select tree (0 disables).
-        g4_mod = int(os.environ.get("KB_G4_MOD", "2"))
-        # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
-        # slots on the alu engine instead of one valu slot.
-        alu_frac = int(os.environ.get("KB_ALU_FRAC", "10"))
+        g4_mod = int(os.environ.get("KB_G4_MOD", "3"))
+        # Fraction (out of alu_mod) of cheap vector ops that run as VLEN
+        # scalar slots on the alu engine instead of one valu slot.
+        alu_mod = int(os.environ.get("KB_ALU_MOD", "16"))
+        alu_frac = int(os.environ.get("KB_ALU_FRAC", "5"))
 
         # First pause: matches the first yield of reference_kernel2. Memory
         # is first modified by the final vstores, so this can sit at cycle 0
@@ -642,15 +659,39 @@ class KernelBuilder:
             else:
                 self.vconst(c1)
                 self.vconst(c3)
-        # addr_next = 2*addr + bit + (1 - forest_p)
-        vc_step = self.vconst(1 - forest_p)
-        # addr at depth D+1 = horner(path bits) + 2^(D+1) - 1 + forest_p
-        # addr at depth Dv+1 = horner(path bits) + 2^(Dv+1) - 1 + forest_p,
-        # for both per-vector select depths.
-        vc_horner = {
-            dv: self.vconst(2 ** (dv + 1) - 1 + forest_p)
-            for dv in {D, max(D - 1, 0)}
-        }
+
+        # Deferred final-stage xor: the last hash stage is
+        # (a ^ C) ^ (a >> k) = a ^ (a >> k) ^ C. For every round but the
+        # last, emit only val_raw = a ^ (a >> k) and push the constant C
+        # into whatever the next round xors in: select tables and the
+        # wrapped root are pre-xored with C (so val_raw ^ (T ^ C) = val ^ T),
+        # gathered node values pay one explicit ^C. Saves an op per
+        # select-sourced round. All branch bits computed from val_raw are
+        # inverted; the select trees swap operands and the address
+        # arithmetic uses negated constants to compensate.
+        op1_l, c1_l, op2_l, _, _ = HASH_STAGES[-1]
+        can_defer = op1_l == "^" and op2_l == "^"
+        defer = can_defer and os.environ.get("KB_DEFER", "1") != "0"
+        if defer:
+            boost = 0  # the split path doesn't handle inverted bits
+        vc_c5 = self.vconst(c1_l) if can_defer else None
+        if defer:
+            # addr_next = 2*addr - bit' + (2 - forest_p)
+            vc_step = self.vconst(2 - forest_p)
+            vc_minus2 = self.vconst(-2)
+            # addr at depth Dv+1 = (forest_p + 2^(Dv+2) - 2) - horner(bits')
+            vc_horner = {
+                dv: self.vconst(forest_p + 2 ** (dv + 2) - 2)
+                for dv in {D, max(D - 1, 0)}
+            }
+        else:
+            # addr_next = 2*addr + bit + (1 - forest_p)
+            vc_step = self.vconst(1 - forest_p)
+            # addr at depth Dv+1 = horner(path bits) + 2^(Dv+1) - 1 + forest_p
+            vc_horner = {
+                dv: self.vconst(2 ** (dv + 1) - 1 + forest_p)
+                for dv in {D, max(D - 1, 0)}
+            }
 
         for k in range(0, n_top_pad, VLEN):
             self.emit(
@@ -661,17 +702,19 @@ class KernelBuilder:
         root_b = self.alloc_scratch("root_b", VLEN)
         self.emit("valu", ("vbroadcast", root_b, nodes_s))
         # When the descent wraps at the leaves, the next round xors with the
-        # root; that xor fuses into the leaf round's final hash stage
-        # ((a ^ C) ^ (a >> k) becomes (a ^ (C ^ root)) ^ (a >> k)).
-        op1_l, c1_l, op2_l, _, _ = HASH_STAGES[-1]
+        # root. With deferral the raw leaf value already carries ^C, so the
+        # wrap xors with (root ^ C); without deferral that constant fuses
+        # into the leaf round's final hash stage instead.
         fused_root = None
-        if op1_l == "^" and op2_l == "^" and rounds > period:
+        if can_defer and rounds > period:
             fused_root = self.alloc_scratch("fused_root", VLEN)
-            self.emit("valu", ("^", fused_root, self.vconst(c1_l), root_b))
+            self.emit("valu", ("^", fused_root, vc_c5, root_b))
         bcast = {}
         diff = {}
         # The bottom select level pairs node p with node p + 2^(d-1) (they
-        # differ in the oldest path bit).
+        # differ in the oldest path bit). With deferral every table value is
+        # pre-xored with the deferred constant, and since the stored branch
+        # bits are inverted, diffs/bases are built for bit'=1 -> lower node.
         for d in range(1, D + 1):
             lo = 2**d - 1
             half = 2 ** (d - 1)
@@ -683,16 +726,28 @@ class KernelBuilder:
                 self.emit("valu", ("vbroadcast", a, nodes_s + lo + p))
                 up = self.alloc_scratch(f"nb_{d}_{p + half}", VLEN)
                 self.emit("valu", ("vbroadcast", up, nodes_s + lo + half + p))
+                if defer:
+                    self.emit("valu", ("^", a, a, vc_c5))
+                    self.emit("valu", ("^", up, up, vc_c5))
                 # Upper broadcasts survive where the flow-engine bottom
-                # selects or the split (pre-xor) path read them directly.
+                # selects read them directly (under deferral the ma base is
+                # the upper node, so it always survives and the dead lower
+                # slot hosts the diff instead). When every vector's bottom
+                # selects at this depth run on flow, the diff is dead: skip
+                # it entirely.
+                always_flow = str(d) in flow_depths and flow_bottom_mod == 1
                 keep = str(d) in flow_depths or (d == 1 and boost > 0)
-                if keep:
+                src1, src0 = (a, up) if defer else (up, a)
+                if always_flow and not (d == 1 and boost > 0):
+                    df = None
+                elif keep:
                     df = self.alloc_scratch(f"nd_{d}_{p}", VLEN)
+                    self.emit("valu", ("-", df, src1, src0))
                 else:
-                    df = up  # diff overwrites the upper broadcast
-                self.emit("valu", ("-", df, up, a))
-                lower.append(a)
-                upper.append(up if keep else None)
+                    df = src1  # diff overwrites the dead selected-by-1 node
+                    self.emit("valu", ("-", df, src1, src0))
+                lower.append(a if (keep or not defer) else None)
+                upper.append(up if (keep or defer) else None)
                 diff[d].append(df)
             bcast[d] = lower + upper
 
@@ -715,7 +770,7 @@ class KernelBuilder:
 
             def scalar():
                 op_counter[0] += 11
-                return op_counter[0] % 32 < alu_frac
+                return op_counter[0] % alu_mod < alu_frac
 
             # Trailing (drain) vectors are latency-bound, not
             # throughput-bound: spend an extra xor to pre-compute both
@@ -726,10 +781,18 @@ class KernelBuilder:
             # depth D instead of running the deepest select tree, shifting
             # valu work onto the load engine's slack.
             Dv = D - 1 if (g4_mod and v % g4_mod == 0 and D >= 1) else D
+            # Was the previous round's hash emitted raw (missing its final
+            # ^C)? Then this round's input xor must supply the constant.
+            prev_raw = defer and r > 0
             if d == 0:
-                # After a wrap the root xor was already fused into the
-                # previous round's hash.
-                nv = root_b if (r == 0 or fused_root is None) else None
+                if r == 0:
+                    nv = root_b
+                elif prev_raw:
+                    # val_raw ^ (root ^ C) == val ^ root
+                    nv = fused_root
+                else:
+                    # The root xor was fused into the leaf round's hash.
+                    nv = None if fused_root is not None else root_b
             elif d <= Dv and boosted:
                 left, right = self.emit_select_tree(
                     d, bits, bcast, diff, free, split=True
@@ -743,38 +806,58 @@ class KernelBuilder:
             elif d <= Dv:
                 bottom_flow = str(d) in flow_depths and v % flow_bottom_mod == 0
                 nv = self.emit_select_tree(
-                    d, bits, bcast, diff, free, bottom_flow=bottom_flow
+                    d, bits, bcast, diff, free, bottom_flow=bottom_flow,
+                    swap=defer,
                 )
             else:
                 nv = free.pop()
                 for k in range(VLEN):
                     self.emit("load", ("load_offset", nv, addr, k), mem="forest")
+                if prev_raw:
+                    # Gathered node values pay the deferred constant here.
+                    self.vop("^", nv, nv, vc_c5, scalar)
             # val = myhash(val ^ node_val)
             if nv is not None:
                 self.vop("^", val, val, nv, scalar)
             ht = [t for t in tmp if t != nv]
-            fuse = fused_root is not None and d == forest_height and r + 1 < rounds
+            raw = defer and r + 1 < rounds
+            fuse = (
+                not defer
+                and fused_root is not None
+                and d == forest_height
+                and r + 1 < rounds
+            )
             self.emit_hash_v(
-                val, ht[0], ht[1], scalar, final_c1=fused_root if fuse else None
+                val, ht[0], ht[1], scalar,
+                final_c1=fused_root if fuse else None, raw=raw,
             )
             if debug and not fuse:
                 # (On fused rounds val carries the next round's root xor, so
-                # it doesn't match the reference trace until the next round.)
+                # it doesn't match the reference trace until the next round.
+                # Raw values need the deferred constant re-applied, in a
+                # debug-only op.)
+                loc = val
+                if raw:
+                    loc = ht[1]
+                    self.emit("valu", ("^", loc, val, vc_c5))
                 keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
-                self.emit("debug", ("vcompare", val, keys))
+                self.emit("debug", ("vcompare", loc, keys))
             # Branch bit; not needed at the leaves (wrap to root) or on
             # the last round.
             if r + 1 < rounds and d != forest_height:
                 b = bits[d] if d < Dv else ht[0]
                 self.vop("&", b, val, vc_one, scalar)
                 # The next gather address is always arranged as
-                # addr = (precomputable accumulator) + b, so the critical
-                # path after the new bit is a single op.
+                # addr = (precomputable accumulator) +/- b, so the critical
+                # path after the new bit is a single op. Under deferral the
+                # bits are inverted, so the accumulators negate the Horner
+                # term and the bit is subtracted.
+                bop, hmul = ("-", vc_minus2) if defer else ("+", vc_two)
                 if d == Dv:
                     # Next round gathers: Horner over the old path bits
-                    # lands in addr ahead of time, then addr += b.
+                    # lands in addr ahead of time, then addr +/-= b.
                     if Dv == 0:
-                        self.emit("valu", ("+", addr, b, vc_horner[Dv]))
+                        self.vop(bop, addr, vc_horner[Dv], b, scalar)
                     else:
                         src = bits[0]
                         for x in bits[1:Dv]:
@@ -783,14 +866,14 @@ class KernelBuilder:
                             )
                             src = addr
                         self.emit(
-                            "valu", ("multiply_add", addr, src, vc_two, vc_horner[Dv])
+                            "valu", ("multiply_add", addr, src, hmul, vc_horner[Dv])
                         )
-                        self.vop("+", addr, addr, b, scalar)
+                        self.vop(bop, addr, addr, b, scalar)
                 elif d > Dv:
-                    # addr = (2*addr + step) + b; the multiply_add only
+                    # addr = (2*addr + step) +/- b; the multiply_add only
                     # needs last round's addr.
                     self.emit("valu", ("multiply_add", addr, addr, vc_two, vc_step))
-                    self.vop("+", addr, addr, b, scalar)
+                    self.vop(bop, addr, addr, b, scalar)
             if r + 1 == rounds:
                 # Write final values back to memory (indices aren't checked).
                 ad = tmp[3] if tmp[3] != nv else tmp[2]
