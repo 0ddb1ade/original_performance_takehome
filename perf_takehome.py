@@ -297,7 +297,11 @@ class KernelBuilder:
         # keeps macro-criticality decisions while breaking ties by emission
         # order, which staggers the chains' phases.
         shift = int(os.environ.get("KB_PRIO_SHIFT", "7"))
-        prio = [-(h >> shift) for h in height]
+        tie = os.environ.get("KB_TIE", "emit")
+        if tie == "exact":
+            prio = [(-(h >> shift), -h) for h in height]
+        else:
+            prio = [(-(h >> shift),) for h in height]
 
         earliest = [0] * n
         avail = {eng: [] for eng in SLOT_LIMITS}
@@ -375,7 +379,9 @@ class KernelBuilder:
                 self.vop(op1, t2, val, c1v, scalar)
                 self.vop(op2, val, t1, t2, scalar)
 
-    def emit_select_tree(self, d, bits, bcast, diff, free, bottom_flow=False):
+    def emit_select_tree(
+        self, d, bits, bcast, diff, free, bottom_flow=False, split=False
+    ):
         """Compute the node value at depth d from the path bits, without
         touching memory: select among the 2**d possible nodes.
 
@@ -390,6 +396,9 @@ class KernelBuilder:
         on older bits and can be scheduled ahead of time. The level at
         recursion depth k keys on bits[d-1-k]; the bottom level pairs nodes
         differing in the oldest bit (the j-MSB), i.e. p vs p + 2**(d-1).
+
+        With split=True the root select is left to the caller: returns the
+        (left, right) candidate registers instead (broadcasts for d == 1).
         """
         half = 2 ** (d - 1)
 
@@ -413,6 +422,10 @@ class KernelBuilder:
             free.append(right)
             return left
 
+        if split:
+            if d == 1:
+                return bcast[d][0], bcast[d][1]
+            return rec(0, 1), rec(1, 1)
         return rec(0, 0)
 
     def build_kernel(
@@ -457,7 +470,7 @@ class KernelBuilder:
         # Tuning knobs (env-overridable for experiments; defaults are the
         # measured best).
         # Number of rotating register pools (in-flight vectors).
-        N_POOLS = int(os.environ.get("KB_POOLS", "13"))
+        N_POOLS = int(os.environ.get("KB_POOLS", "15"))
         # Select-tree bottom levels at depths >= this go to the flow engine.
         # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
         # having idle slots overall, because flow executes only 1 slot/cycle
@@ -466,6 +479,9 @@ class KernelBuilder:
         # Only every flow_bottom_mod-th vector uses flow for bottom selects,
         # keeping the 1-slot flow engine below its capacity.
         flow_bottom_mod = int(os.environ.get("KB_FLOW_BOTTOM_MOD", "2"))
+        # Number of trailing vectors that get the latency-optimized
+        # (pre-xored) select transitions.
+        boost = int(os.environ.get("KB_BOOST", "0"))
         # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
         # slots on the alu engine instead of one valu slot.
         alu_frac = int(os.environ.get("KB_ALU_FRAC", "9"))
@@ -554,13 +570,17 @@ class KernelBuilder:
                 self.emit("valu", ("vbroadcast", a, nodes_s + lo + p))
                 up = self.alloc_scratch(f"nb_{d}_{p + half}", VLEN)
                 self.emit("valu", ("vbroadcast", up, nodes_s + lo + half + p))
-                if keep_upper:
+                # Depth 1's upper broadcast survives when boosted vectors
+                # exist: the split (pre-xor) select path reads both depth-1
+                # candidates directly.
+                keep = keep_upper or (d == 1 and boost > 0)
+                if keep:
                     df = self.alloc_scratch(f"nd_{d}_{p}", VLEN)
                 else:
                     df = up  # diff overwrites the upper broadcast
                 self.emit("valu", ("-", df, up, a))
                 lower.append(a)
-                upper.append(up if keep_upper else None)
+                upper.append(up if keep else None)
                 diff[d].append(df)
             bcast[d] = lower + upper
 
@@ -577,10 +597,33 @@ class KernelBuilder:
                 self.emit("load", ("vload", val, ad), mem=("values", v))
             d = r % period
             free = list(tmp)
+            # Spill a deterministic spread of the cheap vector ops to the
+            # scalar alu (fraction alu_frac/32, rotating per op).
+            op_counter = [v * 7 + r * 5]
+
+            def scalar():
+                op_counter[0] += 11
+                return op_counter[0] % 32 < alu_frac
+
+            # Trailing (drain) vectors are latency-bound, not
+            # throughput-bound: spend an extra xor to pre-compute both
+            # root-select candidates so the round transition is
+            # bit -> vselect (2 cycles) instead of bit -> select -> xor (3).
+            boosted = v >= n_vec - boost
             if d == 0:
                 # After a wrap the root xor was already fused into the
                 # previous round's hash.
                 nv = root_b if (r == 0 or fused_root is None) else None
+            elif d <= D and boosted:
+                left, right = self.emit_select_tree(
+                    d, bits, bcast, diff, free, split=True
+                )
+                xl = free.pop()
+                self.vop("^", xl, val, left, scalar)
+                xr = free.pop()
+                self.vop("^", xr, val, right, scalar)
+                self.emit("flow", ("vselect", val, bits[d - 1], xr, xl))
+                nv = None
             elif d <= D:
                 bottom_flow = d >= flow_min_depth and v % flow_bottom_mod == 0
                 nv = self.emit_select_tree(
@@ -590,14 +633,6 @@ class KernelBuilder:
                 nv = free.pop()
                 for k in range(VLEN):
                     self.emit("load", ("load_offset", nv, addr, k), mem="forest")
-            # Spill a deterministic spread of the cheap vector ops to the
-            # scalar alu (fraction alu_frac/32, rotating per op).
-            op_counter = [v * 7 + r * 5]
-
-            def scalar():
-                op_counter[0] += 11
-                return op_counter[0] % 32 < alu_frac
-
             # val = myhash(val ^ node_val)
             if nv is not None:
                 self.vop("^", val, val, nv, scalar)
@@ -646,12 +681,21 @@ class KernelBuilder:
                 self.emit("flow", ("add_imm", ad, values_base_c, v * VLEN))
                 self.emit("store", ("vstore", ad, val), mem=("values", v))
 
-        if os.environ.get("KB_ORDER", "vec") == "rr":
+        order = os.environ.get("KB_ORDER", "pool")
+        if order == "rr":
             # Round-robin emission within each wave of in-flight vectors.
             for w0 in range(0, n_vec, N_POOLS):
                 wave = range(w0, min(w0 + N_POOLS, n_vec))
                 for r in range(rounds):
                     for v in wave:
+                        emit_vector_round(v, r)
+        elif order == "pool":
+            # Pool-major: a pool's whole chain of vectors is emitted before
+            # the next pool, so later generations on long-chain pools get
+            # early-emission tie priority in the scheduler.
+            for p in range(N_POOLS):
+                for v in range(p, n_vec, N_POOLS):
+                    for r in range(rounds):
                         emit_vector_round(v, r)
         else:
             for v in range(n_vec):
