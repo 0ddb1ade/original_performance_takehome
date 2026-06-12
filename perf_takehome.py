@@ -352,20 +352,27 @@ class KernelBuilder:
         else:
             self.emit("valu", (op, dest, a, b))
 
-    def emit_hash_v(self, val, t1, t2, scalar=lambda: False):
+    def emit_hash_v(self, val, t1, t2, scalar=lambda: False, final_c1=None):
         """Vectorized myhash on the vector register `val` (in place).
 
         Stages of the form (a + C) + (a << k) collapse to a single
         multiply_add: a * (1 + 2**k) + C. The xor-based stages need the full
         three ops; those are cheap and may be spilled to the scalar alu.
+
+        final_c1 substitutes the last stage's xor constant; passing
+        C_last ^ x fuses an extra `^ x` into the hash for free (the last
+        stage is (a ^ C) ^ (a >> k)).
         """
-        for op1, c1, op2, op3, c3 in HASH_STAGES:
+        for si, (op1, c1, op2, op3, c3) in enumerate(HASH_STAGES):
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 mult = self.vconst(1 + (1 << c3))
                 self.emit("valu", ("multiply_add", val, val, mult, self.vconst(c1)))
             else:
+                c1v = self.vconst(c1)
+                if final_c1 is not None and si == len(HASH_STAGES) - 1:
+                    c1v = final_c1
                 self.vop(op3, t1, val, self.vconst(c3), scalar)
-                self.vop(op1, t2, val, self.vconst(c1), scalar)
+                self.vop(op1, t2, val, c1v, scalar)
                 self.vop(op2, val, t1, t2, scalar)
 
     def emit_select_tree(self, d, bits, bcast, diff, free, bottom_flow=False):
@@ -521,6 +528,14 @@ class KernelBuilder:
             )
         root_b = self.alloc_scratch("root_b", VLEN)
         self.emit("valu", ("vbroadcast", root_b, nodes_s))
+        # When the descent wraps at the leaves, the next round xors with the
+        # root; that xor fuses into the leaf round's final hash stage
+        # ((a ^ C) ^ (a >> k) becomes (a ^ (C ^ root)) ^ (a >> k)).
+        op1_l, c1_l, op2_l, _, _ = HASH_STAGES[-1]
+        fused_root = None
+        if op1_l == "^" and op2_l == "^" and rounds > period:
+            fused_root = self.alloc_scratch("fused_root", VLEN)
+            self.emit("valu", ("^", fused_root, self.vconst(c1_l), root_b))
         bcast = {}
         diff = {}
         # The bottom select level pairs node p with node p + 2^(d-1) (they
@@ -563,7 +578,9 @@ class KernelBuilder:
             d = r % period
             free = list(tmp)
             if d == 0:
-                nv = root_b
+                # After a wrap the root xor was already fused into the
+                # previous round's hash.
+                nv = root_b if (r == 0 or fused_root is None) else None
             elif d <= D:
                 bottom_flow = d >= flow_min_depth and v % flow_bottom_mod == 0
                 nv = self.emit_select_tree(
@@ -582,10 +599,16 @@ class KernelBuilder:
                 return op_counter[0] % 32 < alu_frac
 
             # val = myhash(val ^ node_val)
-            self.vop("^", val, val, nv, scalar)
+            if nv is not None:
+                self.vop("^", val, val, nv, scalar)
             ht = [t for t in tmp if t != nv]
-            self.emit_hash_v(val, ht[0], ht[1], scalar)
-            if debug:
+            fuse = fused_root is not None and d == forest_height and r + 1 < rounds
+            self.emit_hash_v(
+                val, ht[0], ht[1], scalar, final_c1=fused_root if fuse else None
+            )
+            if debug and not fuse:
+                # (On fused rounds val carries the next round's root xor, so
+                # it doesn't match the reference trace until the next round.)
                 keys = tuple((r, v * VLEN + k, "hashed_val") for k in range(VLEN))
                 self.emit("debug", ("vcompare", val, keys))
             # Branch bit; not needed at the leaves (wrap to root) or on
