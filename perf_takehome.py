@@ -583,19 +583,19 @@ class KernelBuilder:
         # Select-tree bottom levels at these depths go to the flow engine
         # (e.g. "2" or "23"). Earlier all-depth variants regressed: flow
         # executes only 1 slot/cycle and deep rounds burst vselects.
-        flow_depths = os.environ.get("KB_FLOW_DEPTHS", "")
+        flow_depths = os.environ.get("KB_FLOW_DEPTHS", "12")
         # Only every flow_bottom_mod-th vector uses flow for bottom selects,
         # keeping the 1-slot flow engine below its capacity.
-        flow_bottom_mod = int(os.environ.get("KB_FLOW_BOTTOM_MOD", "2"))
+        flow_bottom_mod = int(os.environ.get("KB_FLOW_BOTTOM_MOD", "1"))
         # Number of trailing vectors that get the latency-optimized
         # (pre-xored) select transitions.
         boost = int(os.environ.get("KB_BOOST", "0"))
         # Every g4_mod-th vector gathers at depth D instead of using the
         # deepest select tree (0 disables).
-        g4_mod = int(os.environ.get("KB_G4_MOD", "0"))
+        g4_mod = int(os.environ.get("KB_G4_MOD", "2"))
         # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
         # slots on the alu engine instead of one valu slot.
-        alu_frac = int(os.environ.get("KB_ALU_FRAC", "11"))
+        alu_frac = int(os.environ.get("KB_ALU_FRAC", "10"))
 
         # First pause: matches the first yield of reference_kernel2. Memory
         # is first modified by the final vstores, so this can sit at cycle 0
