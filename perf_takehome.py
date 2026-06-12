@@ -363,14 +363,42 @@ class KernelBuilder:
         multiply_add: a * (1 + 2**k) + C. The xor-based stages need the full
         three ops; those are cheap and may be spilled to the scalar alu.
 
+        A multiply_add stage followed by (a + C') ^ (a << k') fuses further:
+        both xor operands are linear in the multiply_add's input x
+        (x*m + (C+C') and x*(m<<k') + (C<<k')), so the pair costs two
+        multiply_adds and a xor instead of four ops, and the dependency
+        chain shrinks by a cycle.
+
         final_c1 substitutes the last stage's xor constant; passing
         C_last ^ x fuses an extra `^ x` into the hash for free (the last
         stage is (a ^ C) ^ (a >> k)).
         """
-        for si, (op1, c1, op2, op3, c3) in enumerate(HASH_STAGES):
+        si = 0
+        while si < len(HASH_STAGES):
+            op1, c1, op2, op3, c3 = HASH_STAGES[si]
             if op1 == "+" and op2 == "+" and op3 == "<<":
-                mult = self.vconst(1 + (1 << c3))
-                self.emit("valu", ("multiply_add", val, val, mult, self.vconst(c1)))
+                m = 1 + (1 << c3)
+                if si + 1 < len(HASH_STAGES):
+                    n1, nc1, n2, n3, nc3 = HASH_STAGES[si + 1]
+                    if n1 == "+" and n2 == "^" and n3 == "<<":
+                        sh = 1 << nc3
+                        self.emit(
+                            "valu",
+                            ("multiply_add", t1, val, self.vconst(m),
+                             self.vconst(c1 + nc1)),
+                        )
+                        self.emit(
+                            "valu",
+                            ("multiply_add", t2, val, self.vconst(m * sh),
+                             self.vconst(c1 * sh)),
+                        )
+                        self.vop("^", val, t1, t2, scalar)
+                        si += 2
+                        continue
+                self.emit(
+                    "valu",
+                    ("multiply_add", val, val, self.vconst(m), self.vconst(c1)),
+                )
             else:
                 c1v = self.vconst(c1)
                 if final_c1 is not None and si == len(HASH_STAGES) - 1:
@@ -378,6 +406,7 @@ class KernelBuilder:
                 self.vop(op3, t1, val, self.vconst(c3), scalar)
                 self.vop(op1, t2, val, c1v, scalar)
                 self.vop(op2, val, t1, t2, scalar)
+            si += 1
 
     def emit_select_tree(
         self, d, bits, bcast, diff, free, bottom_flow=False, split=False
@@ -484,7 +513,7 @@ class KernelBuilder:
         boost = int(os.environ.get("KB_BOOST", "0"))
         # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
         # slots on the alu engine instead of one valu slot.
-        alu_frac = int(os.environ.get("KB_ALU_FRAC", "9"))
+        alu_frac = int(os.environ.get("KB_ALU_FRAC", "11"))
 
         # First pause: matches the first yield of reference_kernel2. Memory
         # is first modified by the final vstores, so this can sit at cycle 0
