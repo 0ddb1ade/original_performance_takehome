@@ -137,6 +137,12 @@ class KernelBuilder:
                 raise NotImplementedError(f"Unknown slot {engine} {slot}")
 
     def lower(self, ops):
+        """Lower the flat op list to instruction bundles."""
+        if os.environ.get("KB_SCHED", "prio") == "greedy":
+            return self.lower_greedy(ops)
+        return self.lower_priority(ops)
+
+    def lower_greedy(self, ops):
         """Greedy list scheduler: place each slot in the earliest cycle that
         respects dependencies and per-engine slot limits.
 
@@ -205,6 +211,132 @@ class KernelBuilder:
             if mem_write:
                 mem_last_store[mem] = max(mem_last_store.get(mem, -1), c)
             max_cycle = max(max_cycle, c)
+
+        return [b for b in bundles if b]
+
+    def lower_priority(self, ops):
+        """Critical-path list scheduler.
+
+        Builds the dependency graph (same hazard rules as lower_greedy,
+        encoded as edges: RAW/WAW latency 1, WAR and store/store latency 0),
+        then schedules cycle by cycle, always issuing the ready op with the
+        greatest height (longest dependency chain below it, counting
+        latency-1 edges). Pool-reuse WAR edges chain one vector's ops to the
+        next user of its registers, so heights see through register reuse
+        and the scheduler staggers the generations by true criticality.
+        """
+        from heapq import heappush, heappop
+
+        n = len(ops)
+        accesses = [self.slot_accesses(e, s) for e, s, _ in ops]
+        pred_count = [0] * n
+        succs = [[] for _ in range(n)]
+
+        last_write = {}  # addr -> writer op index
+        readers = {}  # addr -> reader op indices since last write
+        mem_store = {}  # region -> last store index
+        mem_loads = {}  # region -> load indices since last store
+        barrier_idx = None
+        since_barrier = []
+
+        for i, (engine, slot, mem) in enumerate(ops):
+            reads, writes, mem_read, mem_write, barrier = accesses[i]
+            preds = {}
+
+            def addp(j, lat):
+                if j is not None and preds.get(j, -1) < lat:
+                    preds[j] = lat
+
+            if barrier:
+                for j in since_barrier:
+                    addp(j, 0)
+                addp(barrier_idx, 0)
+                since_barrier = []
+                barrier_idx = i
+            else:
+                addp(barrier_idx, 0)
+                for a in reads:
+                    addp(last_write.get(a), 1)
+                for a in writes:
+                    addp(last_write.get(a), 1)
+                    for j in readers.get(a, ()):
+                        addp(j, 0)
+                if mem_read:
+                    addp(mem_store.get(mem), 1)
+                if mem_write:
+                    addp(mem_store.get(mem), 0)
+                    for j in mem_loads.get(mem, ()):
+                        addp(j, 0)
+                since_barrier.append(i)
+                for a in reads:
+                    readers.setdefault(a, []).append(i)
+                for a in writes:
+                    last_write[a] = i
+                    readers[a] = []
+                if mem_read:
+                    mem_loads.setdefault(mem, []).append(i)
+                if mem_write:
+                    mem_store[mem] = i
+                    mem_loads[mem] = []
+            for j, lat in preds.items():
+                succs[j].append((i, lat))
+                pred_count[i] += 1
+
+        height = [0] * n
+        for i in range(n - 1, -1, -1):
+            h = 0
+            for j, lat in succs[i]:
+                v = height[j] + lat
+                if v > h:
+                    h = v
+            height[i] = h
+
+        # Raw height priority makes all in-flight chains advance in lockstep
+        # (equal heights), so their gather phases collide on the 2-slot load
+        # engine while select phases leave it idle. Quantizing the height
+        # keeps macro-criticality decisions while breaking ties by emission
+        # order, which staggers the chains' phases.
+        shift = int(os.environ.get("KB_PRIO_SHIFT", "7"))
+        prio = [-(h >> shift) for h in height]
+
+        earliest = [0] * n
+        avail = {eng: [] for eng in SLOT_LIMITS}
+        future = defaultdict(list)
+        for i in range(n):
+            if pred_count[i] == 0:
+                heappush(avail[ops[i][0]], (prio[i], i))
+
+        bundles = []
+        remaining = n
+        c = 0
+        while remaining:
+            for i in future.pop(c, ()):
+                heappush(avail[ops[i][0]], (prio[i], i))
+            bundle = {}
+            progress = True
+            while progress:
+                progress = False
+                for eng, lim in SLOT_LIMITS.items():
+                    heap = avail[eng]
+                    if not heap:
+                        continue
+                    slots = bundle.setdefault(eng, [])
+                    while len(slots) < lim and heap:
+                        _, i = heappop(heap)
+                        slots.append(ops[i][1])
+                        remaining -= 1
+                        progress = True
+                        for j, lat in succs[i]:
+                            if earliest[j] < c + lat:
+                                earliest[j] = c + lat
+                            pred_count[j] -= 1
+                            if pred_count[j] == 0:
+                                if earliest[j] <= c:
+                                    heappush(avail[ops[j][0]], (prio[j], j))
+                                else:
+                                    future[earliest[j]].append(j)
+            bundles.append({e: s for e, s in bundle.items() if s})
+            c += 1
 
         return [b for b in bundles if b]
 
@@ -318,12 +450,15 @@ class KernelBuilder:
         # Tuning knobs (env-overridable for experiments; defaults are the
         # measured best).
         # Number of rotating register pools (in-flight vectors).
-        N_POOLS = int(os.environ.get("KB_POOLS", "15"))
+        N_POOLS = int(os.environ.get("KB_POOLS", "13"))
         # Select-tree bottom levels at depths >= this go to the flow engine.
         # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
         # having idle slots overall, because flow executes only 1 slot/cycle
         # and depth-4 rounds burst 15 vselects per vector. Disabled (5 > D).
         flow_min_depth = int(os.environ.get("KB_FLOW_MIN_DEPTH", "5"))
+        # Only every flow_bottom_mod-th vector uses flow for bottom selects,
+        # keeping the 1-slot flow engine below its capacity.
+        flow_bottom_mod = int(os.environ.get("KB_FLOW_BOTTOM_MOD", "2"))
         # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
         # slots on the alu engine instead of one valu slot.
         alu_frac = int(os.environ.get("KB_ALU_FRAC", "9"))
@@ -430,7 +565,7 @@ class KernelBuilder:
             if d == 0:
                 nv = root_b
             elif d <= D:
-                bottom_flow = d >= flow_min_depth
+                bottom_flow = d >= flow_min_depth and v % flow_bottom_mod == 0
                 nv = self.emit_select_tree(
                     d, bits, bcast, diff, free, bottom_flow=bottom_flow
                 )
