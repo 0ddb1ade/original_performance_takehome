@@ -138,9 +138,12 @@ class KernelBuilder:
 
     def lower(self, ops):
         """Lower the flat op list to instruction bundles."""
-        if os.environ.get("KB_SCHED", "prio") == "greedy":
+        sched = os.environ.get("KB_SCHED", "deadline")
+        if sched == "greedy":
             return self.lower_greedy(ops)
-        return self.lower_priority(ops)
+        if sched == "prio":
+            return self.lower_priority(ops)
+        return self.lower_deadline(ops)
 
     def lower_greedy(self, ops):
         """Greedy list scheduler: place each slot in the earliest cycle that
@@ -214,19 +217,15 @@ class KernelBuilder:
 
         return [b for b in bundles if b]
 
-    def lower_priority(self, ops):
-        """Critical-path list scheduler.
+    def build_graph(self, ops):
+        """Build the dependency graph over the flat op list.
 
-        Builds the dependency graph (same hazard rules as lower_greedy,
-        encoded as edges: RAW/WAW latency 1, WAR and store/store latency 0),
-        then schedules cycle by cycle, always issuing the ready op with the
-        greatest height (longest dependency chain below it, counting
-        latency-1 edges). Pool-reuse WAR edges chain one vector's ops to the
-        next user of its registers, so heights see through register reuse
-        and the scheduler staggers the generations by true criticality.
+        Hazards become edges: RAW/WAW latency 1 (consumer strictly after
+        producer), WAR and store-store latency 0 (may share a cycle, since
+        reads see start-of-cycle state). Pauses are zero-latency barriers
+        against everything emitted before/after them. Returns
+        (pred_count, succs) with succs[i] = [(consumer, latency), ...].
         """
-        from heapq import heappush, heappop
-
         n = len(ops)
         accesses = [self.slot_accesses(e, s) for e, s, _ in ops]
         pred_count = [0] * n
@@ -282,6 +281,80 @@ class KernelBuilder:
                 succs[j].append((i, lat))
                 pred_count[i] += 1
 
+        return pred_count, succs
+
+    def schedule_pass(self, ops, pred_count, succs, prio):
+        """One resource-constrained list-scheduling pass.
+
+        Cycle by cycle, issues the ready op with the smallest `prio` key per
+        engine, subject to SLOT_LIMITS. Returns (cycle per op, makespan).
+        Zero-latency successors freed by an op may issue in the same cycle.
+        """
+        from heapq import heappush, heappop
+
+        n = len(ops)
+        earliest = [0] * n
+        pred_left = list(pred_count)
+        avail = {eng: [] for eng in SLOT_LIMITS}
+        future = defaultdict(list)
+        for i in range(n):
+            if pred_left[i] == 0:
+                heappush(avail[ops[i][0]], (prio[i], i))
+
+        cycles = [0] * n
+        remaining = n
+        c = 0
+        while remaining:
+            for i in future.pop(c, ()):
+                heappush(avail[ops[i][0]], (prio[i], i))
+            counts = dict.fromkeys(SLOT_LIMITS, 0)
+            progress = True
+            while progress:
+                progress = False
+                for eng, lim in SLOT_LIMITS.items():
+                    heap = avail[eng]
+                    while counts[eng] < lim and heap:
+                        _, i = heappop(heap)
+                        cycles[i] = c
+                        counts[eng] += 1
+                        remaining -= 1
+                        progress = True
+                        for j, lat in succs[i]:
+                            if earliest[j] < c + lat:
+                                earliest[j] = c + lat
+                            pred_left[j] -= 1
+                            if pred_left[j] == 0:
+                                if earliest[j] <= c:
+                                    heappush(avail[ops[j][0]], (prio[j], j))
+                                else:
+                                    future[earliest[j]].append(j)
+            c += 1
+        return cycles, c
+
+    def to_bundles(self, ops, cycles, n_cycles):
+        bundles = [{} for _ in range(n_cycles)]
+        for i, (engine, slot, _) in enumerate(ops):
+            bundles[cycles[i]].setdefault(engine, []).append(slot)
+        return [b for b in bundles if b]
+
+    def lower_priority(self, ops):
+        """Critical-path list scheduler.
+
+        Schedules cycle by cycle, always issuing the ready op with the
+        greatest height (longest dependency chain below it, counting
+        latency-1 edges). Pool-reuse WAR edges chain one vector's ops to the
+        next user of its registers, so heights see through register reuse
+        and the scheduler staggers the generations by true criticality.
+
+        Raw height priority makes all in-flight chains advance in lockstep
+        (equal heights), so their gather phases collide on the 2-slot load
+        engine while select phases leave it idle. Quantizing the height
+        keeps macro-criticality decisions while breaking ties by emission
+        order, which staggers the chains' phases.
+        """
+        n = len(ops)
+        pred_count, succs = self.build_graph(ops)
+
         height = [0] * n
         for i in range(n - 1, -1, -1):
             h = 0
@@ -291,58 +364,62 @@ class KernelBuilder:
                     h = v
             height[i] = h
 
-        # Raw height priority makes all in-flight chains advance in lockstep
-        # (equal heights), so their gather phases collide on the 2-slot load
-        # engine while select phases leave it idle. Quantizing the height
-        # keeps macro-criticality decisions while breaking ties by emission
-        # order, which staggers the chains' phases.
-        shift = int(os.environ.get("KB_PRIO_SHIFT", "7"))
+        shift = int(os.environ.get("KB_PRIO_SHIFT", "8"))
         tie = os.environ.get("KB_TIE", "emit")
         if tie == "exact":
             prio = [(-(h >> shift), -h) for h in height]
         else:
             prio = [(-(h >> shift),) for h in height]
 
-        earliest = [0] * n
-        avail = {eng: [] for eng in SLOT_LIMITS}
-        future = defaultdict(list)
-        for i in range(n):
-            if pred_count[i] == 0:
-                heappush(avail[ops[i][0]], (prio[i], i))
+        cycles, n_cycles = self.schedule_pass(ops, pred_count, succs, prio)
+        return self.to_bundles(ops, cycles, n_cycles)
 
-        bundles = []
-        remaining = n
-        c = 0
-        while remaining:
-            for i in future.pop(c, ()):
-                heappush(avail[ops[i][0]], (prio[i], i))
-            bundle = {}
-            progress = True
-            while progress:
-                progress = False
-                for eng, lim in SLOT_LIMITS.items():
-                    heap = avail[eng]
-                    if not heap:
-                        continue
-                    slots = bundle.setdefault(eng, [])
-                    while len(slots) < lim and heap:
-                        _, i = heappop(heap)
-                        slots.append(ops[i][1])
-                        remaining -= 1
-                        progress = True
-                        for j, lat in succs[i]:
-                            if earliest[j] < c + lat:
-                                earliest[j] = c + lat
-                            pred_count[j] -= 1
-                            if pred_count[j] == 0:
-                                if earliest[j] <= c:
-                                    heappush(avail[ops[j][0]], (prio[j], j))
-                                else:
-                                    future[earliest[j]].append(j)
-            bundles.append({e: s for e, s in bundle.items() if s})
-            c += 1
+    def lower_deadline(self, ops):
+        """Globally deadline-aware scheduler.
 
-        return [b for b in bundles if b]
+        A backward pass schedules the *reversed* dependency graph under the
+        same engine capacities (equivalent to placing every op as late as a
+        resource-feasible schedule allows). That yields a deadline per op
+        that accounts for both dependencies and downstream engine capacity:
+        at most SLOT_LIMITS[e] ops of engine e share any deadline cycle, so
+        deadlines are inherently phase-spread - the property raw
+        critical-path heights lacked. The forward pass then issues by
+        earliest deadline first. Optionally iterates, re-deriving deadlines
+        from the previous forward schedule, keeping the best result.
+        """
+        n = len(ops)
+        pred_count, succs = self.build_graph(ops)
+        rsuccs = [[] for _ in range(n)]
+        rpred = [0] * n
+        for u in range(n):
+            for v, lat in succs[u]:
+                rsuccs[v].append((u, lat))
+                rpred[u] += 1
+
+        # Forward depth = critical path from the sources; the backward
+        # pass's priority (it is the "height" of the reversed graph).
+        depth = [0] * n
+        for u in range(n):
+            for v, lat in succs[u]:
+                if depth[v] < depth[u] + lat:
+                    depth[v] = depth[u] + lat
+
+        shift = int(os.environ.get("KB_PRIO_SHIFT", "8"))
+        iters = int(os.environ.get("KB_SCHED_ITERS", "8"))
+        bprio = [(-(depth[i] >> shift), -i) for i in range(n)]
+
+        best = None
+        for _ in range(max(iters, 1)):
+            bcycles, lb = self.schedule_pass(ops, rpred, rsuccs, bprio)
+            deadline = [lb - 1 - bc for bc in bcycles]
+            fprio = [(deadline[i],) for i in range(n)]
+            fcycles, lf = self.schedule_pass(ops, pred_count, succs, fprio)
+            if best is None or lf < best[1]:
+                best = (fcycles, lf)
+            # Next backward pass: latest-finishing-first in reverse time.
+            bprio = [(-fcycles[i], -i) for i in range(n)]
+
+        return self.to_bundles(ops, best[0], best[1])
 
     def vop(self, op, dest, a, b, scalar=lambda: False):
         """An elementwise vector op, either as one valu slot or as VLEN
