@@ -503,11 +503,10 @@ class KernelBuilder:
         # measured best).
         # Number of rotating register pools (in-flight vectors).
         N_POOLS = int(os.environ.get("KB_POOLS", "15"))
-        # Select-tree bottom levels at depths >= this go to the flow engine.
-        # Measured: enabling this (e.g. 4) regresses ~30 cycles despite flow
-        # having idle slots overall, because flow executes only 1 slot/cycle
-        # and depth-4 rounds burst 15 vselects per vector. Disabled (5 > D).
-        flow_min_depth = int(os.environ.get("KB_FLOW_MIN_DEPTH", "5"))
+        # Select-tree bottom levels at these depths go to the flow engine
+        # (e.g. "2" or "23"). Earlier all-depth variants regressed: flow
+        # executes only 1 slot/cycle and deep rounds burst vselects.
+        flow_depths = os.environ.get("KB_FLOW_DEPTHS", "")
         # Only every flow_bottom_mod-th vector uses flow for bottom selects,
         # keeping the 1-slot flow engine below its capacity.
         flow_bottom_mod = int(os.environ.get("KB_FLOW_BOTTOM_MOD", "2"))
@@ -595,10 +594,7 @@ class KernelBuilder:
         bcast = {}
         diff = {}
         # The bottom select level pairs node p with node p + 2^(d-1) (they
-        # differ in the oldest path bit). Upper-half broadcasts are only kept
-        # when the flow-engine bottom-level select path needs them; otherwise
-        # their slots become the diffs.
-        keep_upper = flow_min_depth <= D
+        # differ in the oldest path bit).
         for d in range(1, D + 1):
             lo = 2**d - 1
             half = 2 ** (d - 1)
@@ -610,10 +606,9 @@ class KernelBuilder:
                 self.emit("valu", ("vbroadcast", a, nodes_s + lo + p))
                 up = self.alloc_scratch(f"nb_{d}_{p + half}", VLEN)
                 self.emit("valu", ("vbroadcast", up, nodes_s + lo + half + p))
-                # Depth 1's upper broadcast survives when boosted vectors
-                # exist: the split (pre-xor) select path reads both depth-1
-                # candidates directly.
-                keep = keep_upper or (d == 1 and boost > 0)
+                # Upper broadcasts survive where the flow-engine bottom
+                # selects or the split (pre-xor) path read them directly.
+                keep = str(d) in flow_depths or (d == 1 and boost > 0)
                 if keep:
                     df = self.alloc_scratch(f"nd_{d}_{p}", VLEN)
                 else:
@@ -669,7 +664,7 @@ class KernelBuilder:
                 self.emit("flow", ("vselect", val, bits[d - 1], xr, xl))
                 nv = None
             elif d <= Dv:
-                bottom_flow = d >= flow_min_depth and v % flow_bottom_mod == 0
+                bottom_flow = str(d) in flow_depths and v % flow_bottom_mod == 0
                 nv = self.emit_select_tree(
                     d, bits, bcast, diff, free, bottom_flow=bottom_flow
                 )
