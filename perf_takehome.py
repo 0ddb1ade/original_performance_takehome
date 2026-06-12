@@ -51,12 +51,14 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def emit(self, engine, slot, mem=None):
+    def emit(self, engine, slot, mem=None, spill=False):
         """Queue a slot. `mem` is an optional region tag for memory ops;
         ops with different tags are assumed not to alias (regions here are
         the read-only forest and the per-vector value slices, which are all
-        disjoint)."""
-        self.ops.append((engine, slot, mem))
+        disjoint). `spill` marks an elementwise valu op that the scheduler
+        may instead realize as VLEN scalar alu slots (same dependencies and
+        latency), choosing per op at issue time."""
+        self.ops.append((engine, slot, mem, spill))
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -174,7 +176,7 @@ class KernelBuilder:
                     return c
                 c += 1
 
-        for engine, slot, mem in ops:
+        for engine, slot, mem, _ in ops:
             reads, writes, mem_read, mem_write, barrier = self.slot_accesses(
                 engine, slot
             )
@@ -227,7 +229,7 @@ class KernelBuilder:
         (pred_count, succs) with succs[i] = [(consumer, latency), ...].
         """
         n = len(ops)
-        accesses = [self.slot_accesses(e, s) for e, s, _ in ops]
+        accesses = [self.slot_accesses(e, s) for e, s, _, _ in ops]
         pred_count = [0] * n
         succs = [[] for _ in range(n)]
 
@@ -238,7 +240,7 @@ class KernelBuilder:
         barrier_idx = None
         since_barrier = []
 
-        for i, (engine, slot, mem) in enumerate(ops):
+        for i, (engine, slot, mem, _) in enumerate(ops):
             reads, writes, mem_read, mem_write, barrier = accesses[i]
             preds = {}
 
@@ -287,10 +289,22 @@ class KernelBuilder:
         """One resource-constrained list-scheduling pass.
 
         Cycle by cycle, issues the ready op with the smallest `prio` key per
-        engine, subject to SLOT_LIMITS. Returns (cycle per op, makespan).
-        Zero-latency successors freed by an op may issue in the same cycle.
+        engine, subject to SLOT_LIMITS. Zero-latency successors freed by an
+        op may issue in the same cycle.
+
+        Spill-flagged valu ops may instead be realized as VLEN scalar alu
+        slots, decided per op at issue time: once valu is full in a cycle,
+        the next-highest-priority spillable ops fill leftover alu capacity.
+        A spilled op normally lands whole (VLEN lanes, same cycle, same
+        latency as valu); at the cycle's end one op may straddle into the
+        next cycle's alu slots, in which case its successors key on the
+        last lane (the remaining lanes are < VLEN, so a straddler always
+        completes in the following cycle). Reads of straddled lanes still
+        see start-of-cycle state, so the hazard edges remain valid.
+
+        Returns (completion cycle per op, makespan, bundles).
         """
-        from heapq import heappush, heappop
+        from heapq import heappush, heappop, heapify
 
         n = len(ops)
         earliest = [0] * n
@@ -303,11 +317,49 @@ class KernelBuilder:
 
         cycles = [0] * n
         remaining = n
+        bundles = []
+        partial = None  # (op index, lanes already placed)
+
+        def bundle(c):
+            while c >= len(bundles):
+                bundles.append({})
+            return bundles[c]
+
+        def lanes(i, lo, hi, c):
+            op, dest, a, b = ops[i][1]
+            slots = bundle(c).setdefault("alu", [])
+            for k in range(lo, hi):
+                slots.append((op, dest + k, a + k, b + k))
+
         c = 0
-        while remaining:
+        while remaining or partial is not None:
+            counts = dict.fromkeys(SLOT_LIMITS, 0)
+            done = []  # ops completing this cycle
+            if partial is not None:
+                i, placed = partial
+                lanes(i, placed, VLEN, c)
+                counts["alu"] = VLEN - placed
+                done.append(partial[0])
+                partial = None
             for i in future.pop(c, ()):
                 heappush(avail[ops[i][0]], (prio[i], i))
-            counts = dict.fromkeys(SLOT_LIMITS, 0)
+
+            def complete(i):
+                nonlocal remaining
+                cycles[i] = c
+                remaining -= 1
+                for j, lat in succs[i]:
+                    if earliest[j] < c + lat:
+                        earliest[j] = c + lat
+                    pred_left[j] -= 1
+                    if pred_left[j] == 0:
+                        if earliest[j] <= c:
+                            heappush(avail[ops[j][0]], (prio[j], j))
+                        else:
+                            future[earliest[j]].append(j)
+
+            for i in done:
+                complete(i)
             progress = True
             while progress:
                 progress = False
@@ -315,27 +367,47 @@ class KernelBuilder:
                     heap = avail[eng]
                     while counts[eng] < lim and heap:
                         _, i = heappop(heap)
-                        cycles[i] = c
+                        bundle(c).setdefault(eng, []).append(ops[i][1])
                         counts[eng] += 1
-                        remaining -= 1
                         progress = True
-                        for j, lat in succs[i]:
-                            if earliest[j] < c + lat:
-                                earliest[j] = c + lat
-                            pred_left[j] -= 1
-                            if pred_left[j] == 0:
-                                if earliest[j] <= c:
-                                    heappush(avail[ops[j][0]], (prio[j], j))
-                                else:
-                                    future[earliest[j]].append(j)
+                        complete(i)
+                # Whole-op spills: highest-priority ready spillables take
+                # VLEN leftover alu slots each.
+                stash = []
+                heap = avail["valu"]
+                while counts["alu"] + VLEN <= SLOT_LIMITS["alu"] and heap:
+                    pi, i = heappop(heap)
+                    if not ops[i][3]:
+                        stash.append((pi, i))
+                        continue
+                    lanes(i, 0, VLEN, c)
+                    counts["alu"] += VLEN
+                    progress = True
+                    complete(i)
+                for e in stash:
+                    heappush(heap, e)
+            # Optionally start one straddling spill in the remaining alu
+            # slots; it completes (and frees successors) next cycle. The +1
+            # latency lands on the *least* urgent ready spillable, so
+            # critical chains keep their full-rate placements.
+            free = SLOT_LIMITS["alu"] - counts["alu"]
+            if 0 < free < VLEN and remaining:
+                heap = avail["valu"]
+                pick = -1
+                for idx in range(len(heap)):
+                    if ops[heap[idx][1]][3] and (
+                        pick < 0 or heap[idx][0] > heap[pick][0]
+                    ):
+                        pick = idx
+                if pick >= 0:
+                    i = heap[pick][1]
+                    heap[pick] = heap[-1]
+                    heap.pop()
+                    heapify(heap)
+                    lanes(i, 0, free, c)
+                    partial = (i, free)
             c += 1
-        return cycles, c
-
-    def to_bundles(self, ops, cycles, n_cycles):
-        bundles = [{} for _ in range(n_cycles)]
-        for i, (engine, slot, _) in enumerate(ops):
-            bundles[cycles[i]].setdefault(engine, []).append(slot)
-        return [b for b in bundles if b]
+        return cycles, c, [b for b in bundles if b]
 
     def lower_priority(self, ops):
         """Critical-path list scheduler.
@@ -371,8 +443,8 @@ class KernelBuilder:
         else:
             prio = [(-(h >> shift),) for h in height]
 
-        cycles, n_cycles = self.schedule_pass(ops, pred_count, succs, prio)
-        return self.to_bundles(ops, cycles, n_cycles)
+        _, _, bundles = self.schedule_pass(ops, pred_count, succs, prio)
+        return bundles
 
     def lower_deadline(self, ops):
         """Globally deadline-aware scheduler.
@@ -405,33 +477,40 @@ class KernelBuilder:
                     depth[v] = depth[u] + lat
 
         shift = int(os.environ.get("KB_PRIO_SHIFT", "8"))
-        iters = int(os.environ.get("KB_SCHED_ITERS", "8"))
+        iters = int(os.environ.get("KB_SCHED_ITERS", "48"))
         bprio = [(-(depth[i] >> shift), -i) for i in range(n)]
 
         best = None
         for _ in range(max(iters, 1)):
-            bcycles, lb = self.schedule_pass(ops, rpred, rsuccs, bprio)
+            bcycles, lb, _ = self.schedule_pass(ops, rpred, rsuccs, bprio)
             deadline = [lb - 1 - bc for bc in bcycles]
             fprio = [(deadline[i],) for i in range(n)]
-            fcycles, lf = self.schedule_pass(ops, pred_count, succs, fprio)
+            fcycles, lf, fbundles = self.schedule_pass(ops, pred_count, succs, fprio)
             if best is None or lf < best[1]:
-                best = (fcycles, lf)
+                best = (fcycles, lf, fbundles)
             # Next backward pass: latest-finishing-first in reverse time.
             bprio = [(-fcycles[i], -i) for i in range(n)]
 
-        return self.to_bundles(ops, best[0], best[1])
+        return best[2]
 
     def vop(self, op, dest, a, b, scalar=lambda: False):
-        """An elementwise vector op, either as one valu slot or as VLEN
-        scalar alu slots (the alu engine has 12 slots/cycle and is otherwise
-        idle, so spilling cheap vector ops there relieves the valu engine).
-        `scalar` is a callable so the spill policy can rotate per op.
+        """An elementwise vector op that can run as one valu slot or as VLEN
+        scalar alu slots (the alu engine has 12 slots/cycle, so spilling
+        cheap vector ops there relieves the valu engine).
+
+        The rotating `scalar` policy statically assigns a base fraction to
+        the alu engine at emission time (this keeps the alu side of the
+        ready frontier wide); in dynamic-spill mode the rest is emitted as
+        spill-flagged nodes and the scheduler resolves the residual
+        imbalance per op at issue time.
         """
         if scalar():
             for i in range(VLEN):
                 self.emit("alu", (op, dest + i, a + i, b + i))
         else:
-            self.emit("valu", (op, dest, a, b))
+            self.emit(
+                "valu", (op, dest, a, b), spill=getattr(self, "dyn_spill", True)
+            )
 
     def emit_hash_v(
         self, val, t1, t2, scalar=lambda: False, final_c1=None, raw=False
@@ -609,10 +688,12 @@ class KernelBuilder:
         # Every g4_mod-th vector gathers at depth D instead of using the
         # deepest select tree (0 disables).
         g4_mod = int(os.environ.get("KB_G4_MOD", "3"))
-        # Fraction (out of alu_mod) of cheap vector ops that run as VLEN
-        # scalar slots on the alu engine instead of one valu slot.
+        # Dynamic spill: the scheduler chooses valu vs alu per op at issue
+        # time. KB_SPILL=static reverts to the emission-time rotating
+        # fraction (alu_frac out of alu_mod).
+        self.dyn_spill = os.environ.get("KB_SPILL", "dyn") == "dyn"
         alu_mod = int(os.environ.get("KB_ALU_MOD", "16"))
-        alu_frac = int(os.environ.get("KB_ALU_FRAC", "5"))
+        alu_frac = int(os.environ.get("KB_ALU_FRAC", "4"))
 
         # First pause: matches the first yield of reference_kernel2. Memory
         # is first modified by the final vstores, so this can sit at cycle 0
