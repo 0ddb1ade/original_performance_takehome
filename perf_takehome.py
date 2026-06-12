@@ -494,7 +494,10 @@ class KernelBuilder:
         indices_p = forest_p + n_nodes
         values_p = indices_p + batch_size
         period = forest_height + 1
-        D = min(4, forest_height)  # max depth resolved by select trees
+        # Max depth resolved by select trees; deeper rounds gather. Lowering
+        # this trades valu select ops for load slots and frees the deepest
+        # broadcast tables' scratch.
+        D = min(int(os.environ.get("KB_SELECT_DEPTH", "4")), forest_height)
 
         # Tuning knobs (env-overridable for experiments; defaults are the
         # measured best).
@@ -511,6 +514,9 @@ class KernelBuilder:
         # Number of trailing vectors that get the latency-optimized
         # (pre-xored) select transitions.
         boost = int(os.environ.get("KB_BOOST", "0"))
+        # Every g4_mod-th vector gathers at depth D instead of using the
+        # deepest select tree (0 disables).
+        g4_mod = int(os.environ.get("KB_G4_MOD", "0"))
         # Fraction (out of 32) of cheap vector ops that run as VLEN scalar
         # slots on the alu engine instead of one valu slot.
         alu_frac = int(os.environ.get("KB_ALU_FRAC", "11"))
@@ -563,7 +569,12 @@ class KernelBuilder:
         # addr_next = 2*addr + bit + (1 - forest_p)
         vc_step = self.vconst(1 - forest_p)
         # addr at depth D+1 = horner(path bits) + 2^(D+1) - 1 + forest_p
-        vc_horner = self.vconst(2 ** (D + 1) - 1 + forest_p)
+        # addr at depth Dv+1 = horner(path bits) + 2^(Dv+1) - 1 + forest_p,
+        # for both per-vector select depths.
+        vc_horner = {
+            dv: self.vconst(2 ** (dv + 1) - 1 + forest_p)
+            for dv in {D, max(D - 1, 0)}
+        }
 
         for k in range(0, n_top_pad, VLEN):
             self.emit(
@@ -639,11 +650,15 @@ class KernelBuilder:
             # root-select candidates so the round transition is
             # bit -> vselect (2 cycles) instead of bit -> select -> xor (3).
             boosted = v >= n_vec - boost
+            # Per-vector select depth: every g4_mod-th vector gathers at
+            # depth D instead of running the deepest select tree, shifting
+            # valu work onto the load engine's slack.
+            Dv = D - 1 if (g4_mod and v % g4_mod == 0 and D >= 1) else D
             if d == 0:
                 # After a wrap the root xor was already fused into the
                 # previous round's hash.
                 nv = root_b if (r == 0 or fused_root is None) else None
-            elif d <= D and boosted:
+            elif d <= Dv and boosted:
                 left, right = self.emit_select_tree(
                     d, bits, bcast, diff, free, split=True
                 )
@@ -653,7 +668,7 @@ class KernelBuilder:
                 self.vop("^", xr, val, right, scalar)
                 self.emit("flow", ("vselect", val, bits[d - 1], xr, xl))
                 nv = None
-            elif d <= D:
+            elif d <= Dv:
                 bottom_flow = d >= flow_min_depth and v % flow_bottom_mod == 0
                 nv = self.emit_select_tree(
                     d, bits, bcast, diff, free, bottom_flow=bottom_flow
@@ -678,28 +693,28 @@ class KernelBuilder:
             # Branch bit; not needed at the leaves (wrap to root) or on
             # the last round.
             if r + 1 < rounds and d != forest_height:
-                b = bits[d] if d < D else ht[0]
+                b = bits[d] if d < Dv else ht[0]
                 self.vop("&", b, val, vc_one, scalar)
                 # The next gather address is always arranged as
                 # addr = (precomputable accumulator) + b, so the critical
                 # path after the new bit is a single op.
-                if d == D:
+                if d == Dv:
                     # Next round gathers: Horner over the old path bits
                     # lands in addr ahead of time, then addr += b.
-                    if D == 0:
-                        self.emit("valu", ("+", addr, b, vc_horner))
+                    if Dv == 0:
+                        self.emit("valu", ("+", addr, b, vc_horner[Dv]))
                     else:
                         src = bits[0]
-                        for x in bits[1:]:
+                        for x in bits[1:Dv]:
                             self.emit(
                                 "valu", ("multiply_add", addr, src, vc_two, x)
                             )
                             src = addr
                         self.emit(
-                            "valu", ("multiply_add", addr, src, vc_two, vc_horner)
+                            "valu", ("multiply_add", addr, src, vc_two, vc_horner[Dv])
                         )
                         self.vop("+", addr, addr, b, scalar)
-                elif d > D:
+                elif d > Dv:
                     # addr = (2*addr + step) + b; the multiply_add only
                     # needs last round's addr.
                     self.emit("valu", ("multiply_add", addr, addr, vc_two, vc_step))
